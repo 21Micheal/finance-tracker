@@ -2,22 +2,26 @@ import { useAuth } from "@/context/AuthContext";
 import { supabase } from "@/lib/supabaseClient";
 import { useEffect, useState, useCallback } from "react";
 import { notify } from "@/utils/toastHelper";
-import { Upload } from "lucide-react";
+import { linkPhone } from "@/lib/auth";
+import { Upload, Phone } from "lucide-react";
+import { toast } from "sonner";
 
 export default function Profile() {
-  const { user } = useAuth();
+  const { user, token } = useAuth();
 
   const [profileData, setProfileData] = useState({});
   const [fullName, setFullName] = useState("");
   const [bio, setBio] = useState("");
   const [newEmail, setNewEmail] = useState("");
   const [newPassword, setNewPassword] = useState("");
+  const [phone, setPhone] = useState("");
 
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [changingEmail, setChangingEmail] = useState(false);
   const [changingPassword, setChangingPassword] = useState(false);
+  const [phoneLoading, setPhoneLoading] = useState(false);
   const [deleting, setDeleting] = useState(false);
 
   // Fetch Profile
@@ -40,6 +44,9 @@ export default function Profile() {
       } else {
         setProfileData({ full_name: "", bio: "", avatar_url: "" });
       }
+      
+      // Set phone from user data
+      setPhone(user?.phone || "");
     } catch (err) {
       console.error("Error fetching profile:", err);
       notify.error("Failed to Load Profile", "Unable to fetch your profile data.");
@@ -70,7 +77,6 @@ export default function Profile() {
       const filePath = `${user.id}/${Date.now()}.${fileExt}`;
 
       // ✅ Upload with correct MIME - delete old file first if exists
-     // ✅ Upload with correct MIME - delete old file first if exists
       const oldPath = `${user.id}/`;
       const { data: existingFiles } = await supabase.storage
         .from("avatars")
@@ -88,7 +94,6 @@ export default function Profile() {
           upsert: false,
           contentType: file.type,
         });
-      
 
       if (uploadError) throw uploadError;
 
@@ -143,6 +148,25 @@ export default function Profile() {
       notify.success("Profile Saved", "Your profile information has been updated!");
     }
     setSaving(false);
+  };
+
+  // 🔹 Handle phone link
+  const handleLinkPhone = async (e) => {
+    e.preventDefault();
+    if (!phone) {
+      toast.error("Please enter your phone number");
+      return;
+    }
+    
+    setPhoneLoading(true);
+    try {
+      const result = await linkPhone(phone, token);
+      toast.success(result.message || "Phone linked successfully!");
+    } catch (err) {
+      toast.error(err.message || "Failed to link phone number");
+    } finally {
+      setPhoneLoading(false);
+    }
   };
 
   // Change Email
@@ -298,6 +322,51 @@ export default function Profile() {
             >
               {saving ? "Saving..." : "Save Profile Details"}
             </button>
+          </section>
+
+          {/* M-Pesa Phone Link Section */}
+          <section className="border-b border-slate-200 dark:border-slate-700 pb-6">
+            <div className="flex items-start gap-3 mb-4">
+              <div className="p-2 bg-green-100 dark:bg-green-900/30 rounded-lg">
+                <Phone className="w-5 h-5 text-green-600 dark:text-green-400" />
+              </div>
+              <div className="flex-1">
+                <h2 className="text-lg font-semibold text-slate-900 dark:text-slate-100">
+                  M-Pesa Phone Number
+                </h2>
+                <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
+                  Link your M-Pesa number to automatically import transactions
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-3">
+              <input
+                type="tel"
+                value={phone}
+                onChange={(e) => setPhone(e.target.value)}
+                placeholder="e.g. 0712345678"
+                className="flex-1 rounded-xl border border-slate-300 dark:border-slate-700 px-3 py-2 bg-slate-50 dark:bg-slate-700 text-slate-900 dark:text-slate-100"
+              />
+              <button
+                onClick={handleLinkPhone}
+                disabled={phoneLoading}
+                className={`px-4 py-2 rounded-xl text-white font-medium transition whitespace-nowrap ${
+                  phoneLoading
+                    ? "bg-green-400 cursor-not-allowed"
+                    : "bg-green-600 hover:bg-green-700"
+                }`}
+              >
+                {phoneLoading ? "Syncing..." : "Link & Sync"}
+              </button>
+            </div>
+            
+            {user?.phone && (
+              <p className="text-xs text-green-600 dark:text-green-400 mt-2 flex items-center gap-1">
+                <span className="w-2 h-2 bg-green-500 rounded-full"></span>
+                Currently linked: {user.phone}
+              </p>
+            )}
           </section>
 
           {/* Account Management */}

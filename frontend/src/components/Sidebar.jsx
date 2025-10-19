@@ -26,8 +26,8 @@ export default function Sidebar() {
   const navItems = [
     { path: "/dashboard", icon: LayoutDashboard, label: "Dashboard" },
     { path: "/transactions", icon: ListOrdered, label: "Transactions" },
-    { path: "/analytics", icon: BarChart3, label: "Analytics" },
-    { path: "/insights", icon: Brain, label: "AI Insights" }, // ✅ New link
+    //{ path: "/analytics", icon: BarChart3, label: "Analytics" },
+    { path: "/insights", icon: Brain, label: "AI Insights" },
     { path: "/settings", icon: Settings, label: "Settings" },
   ];
 
@@ -41,15 +41,22 @@ export default function Sidebar() {
         {isOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
       </button>
 
-      {/* Sidebar Container */}
+      {/* Sidebar Container - Made sticky/fixed */}
       <aside
         className={clsx(
-          "fixed lg:static inset-y-0 left-0 z-40 w-80 bg-white dark:bg-slate-800 border-r border-slate-200 dark:border-slate-700 transform transition-transform duration-300 ease-in-out flex flex-col h-screen",
-          isOpen ? "translate-x-0" : "-translate-x-full lg:translate-x-0"
+          "fixed lg:sticky inset-y-0 left-0 z-40 w-80 bg-white dark:bg-slate-800 border-r border-slate-200 dark:border-slate-700 transform transition-transform duration-300 ease-in-out flex flex-col h-screen lg:translate-x-0",
+          isOpen ? "translate-x-0" : "-translate-x-full"
         )}
+        style={{
+          position: 'fixed', // Ensure fixed positioning
+          top: 0,
+          left: 0,
+          bottom: 0,
+          overflow: 'hidden' // Prevent internal scrolling
+        }}
       >
         {/* Header Section */}
-        <div className="p-6 border-b border-slate-200 dark:border-slate-700">
+        <div className="p-6 border-b border-slate-200 dark:border-slate-700 shrink-0">
           <div className="flex items-center gap-3 mb-2">
             <div className="p-2 bg-gradient-to-br from-indigo-500 to-purple-600 rounded-xl shadow-lg">
               <Wallet className="w-6 h-6 text-white" />
@@ -65,8 +72,8 @@ export default function Sidebar() {
           )}
         </div>
 
-        {/* Main Navigation */}
-        <div className="flex-1 p-6">
+        {/* Main Navigation - Made scrollable internally if needed */}
+        <div className="flex-1 p-6 overflow-y-auto" style={{ overflowY: 'auto' }}>
           <nav className="flex flex-col space-y-2">
             {navItems.map(({ path, icon: Icon, label }) => {
               const active = location.pathname === path;
@@ -120,8 +127,8 @@ export default function Sidebar() {
           </div>
         </div>
 
-        {/* Footer Section */}
-        <div className="p-6 border-t border-slate-200 dark:border-slate-700">
+        {/* Footer Section - Fixed at bottom */}
+        <div className="p-6 border-t border-slate-200 dark:border-slate-700 shrink-0">
           <Button
             variant="outline"
             onClick={logout}

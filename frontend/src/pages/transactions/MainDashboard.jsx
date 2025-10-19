@@ -1,17 +1,19 @@
-import { useState, useMemo, useEffect } from "react";
+import { useState, useMemo, useEffect, useCallback } from "react";
 import { useAuth } from "@/context/AuthContext";
 import { useTransactions } from "@/hooks/useTransactions";
 import { useCurrency } from "@/context/CurrencyContext";
 import { BudgetAlerts } from '@/components/BudgetAlerts';
-import { BUDGET_CATEGORIES, DEFAULT_SPENDING_CAPS } from '@/utils/budgetService';
+import { DEFAULT_SPENDING_CAPS } from '@/utils/budgetService';
 import { Button } from "@/components/ui/Button";
 import DashboardView from "@/pages/transactions/DashboardView";
 import TransactionsView from "@/pages/transactions/TransactionsView";
-import SettingsView from "@/pages/transactions/SettingsView";
+import SettingsView from "@/pages/settings/SettingsView";
 import { AddTransactionModal } from "@/pages/transactions/AddTransactionModal";
 import { EditTransactionModal } from "@/pages/transactions/EditTransactionModal";
 import { generateAIInsights } from "@/lib/aiInsights";
 import { motion, AnimatePresence } from "framer-motion";
+import { Card, CardContent } from "@/components/ui/cards";
+import { toast } from "react-hot-toast"; 
 import { ResponsiveContainer, BarChart, Bar, CartesianGrid, XAxis, YAxis, Tooltip } from "recharts";
 import { 
   Wallet, 
@@ -26,9 +28,18 @@ import {
   FileDown, 
   ChevronDown, 
   ChevronUp,
-  AlertCircle
+  Clock,
+  RefreshCw,
+  ArrowDownCircle,
+  ArrowUpCircle,
+  Phone,
+  AlertCircle,
+  Filter
 } from "lucide-react";
 import jsPDF from "jspdf";
+
+// Constants
+const MPESA_SYNC_INTERVAL = 60000; // Increased to 60 seconds to reduce frequency
 
 export default function TransactionsDashboard() {
   const [view, setView] = useState("dashboard");
@@ -45,78 +56,169 @@ export default function TransactionsDashboard() {
     trends: true,
     tips: false,
     summary: true,
+    mpesa: true,
   });
-  // Add spending caps state
+  const [mpesaTransactions, setMpesaTransactions] = useState([]);
+  const [lastSync, setLastSync] = useState(null);
   const [spendingCaps, setSpendingCaps] = useState(() => {
-    const saved = localStorage.getItem('spendingCaps');
+    const saved = localStorage.getItem("spendingCaps");
     return saved ? JSON.parse(saved) : DEFAULT_SPENDING_CAPS;
   });
+  const [dateRange, setDateRange] = useState("all"); // "week", "month", "year", "all"
 
   const { user } = useAuth();
-  const { currency, format } = useCurrency(); // Updated: use format instead of rate
-  const { transactions, addTransaction, updateTransaction, deleteTransaction, loading, error } =
-    useTransactions(user);
+  const { currency, format } = useCurrency();
+  const {
+    transactions,
+    addTransaction,
+    updateTransaction,
+    deleteTransaction,
+    loading,
+    error,
+    fetchMpesaTransactions,
+  } = useTransactions(user);
 
-  // Persist savings goal
+  // 🧠 Persist savings goal and spending caps
   useEffect(() => {
-    localStorage.setItem("savingsGoal", savingsGoal);
+    localStorage.setItem("savingsGoal", savingsGoal.toString());
   }, [savingsGoal]);
 
-  // Calculate summary data
-  const summary = useMemo(() => {
-    const income = transactions
-      .filter((t) => t.type === "income")
-      .reduce((sum, t) => sum + t.amount, 0);
-    const expense = transactions
-      .filter((t) => t.type === "expense")
-      .reduce((sum, t) => sum + t.amount, 0);
-    const balance = income - expense;
-    return { income, expense, balance };
-  }, [transactions]);
+  useEffect(() => {
+    localStorage.setItem("spendingCaps", JSON.stringify(spendingCaps));
+  }, [spendingCaps]);
 
-  // Format transactions with currency using the format function
-  const formattedTransactions = useMemo(() => 
-    transactions.map((tx) => ({
+  // 🔄 Sync M-Pesa transactions with proper cleanup and reduced frequency
+  const syncMpesaTransactions = useCallback(async () => {
+    try {
+      const mpesaTx = await fetchMpesaTransactions();
+      
+      if (Array.isArray(mpesaTx) && mpesaTx.length > 0) {
+        // Update recent transactions for the M-Pesa feed display only
+        setMpesaTransactions(mpesaTx.slice(-5));
+        setLastSync(new Date());
+      }
+    } catch (err) {
+      console.error("M-Pesa sync error:", err);
+      // Don't show toast for connection errors to reduce noise
+    }
+  }, [fetchMpesaTransactions]);
+
+  // M-Pesa sync effect with proper cleanup
+  useEffect(() => {
+    let intervalId;
+    
+    const initializeSync = async () => {
+      await syncMpesaTransactions(); // Initial sync
+      intervalId = setInterval(syncMpesaTransactions, MPESA_SYNC_INTERVAL);
+    };
+
+    initializeSync();
+
+    return () => {
+      if (intervalId) {
+        clearInterval(intervalId);
+      }
+    };
+  }, [syncMpesaTransactions]);
+
+  // 💰 Filter transactions by date range
+  const filteredTransactions = useMemo(() => {
+    if (dateRange === "all") return transactions;
+
+    const now = new Date();
+    let startDate = new Date();
+
+    switch (dateRange) {
+      case "week":
+        startDate.setDate(now.getDate() - 7);
+        break;
+      case "month":
+        startDate.setMonth(now.getMonth() - 1);
+        break;
+      case "year":
+        startDate.setFullYear(now.getFullYear() - 1);
+        break;
+      default:
+        return transactions;
+    }
+
+    return transactions.filter(tx => {
+      const txDate = new Date(tx.date);
+      return txDate >= startDate;
+    });
+  }, [transactions, dateRange]);
+
+  // 💰 Summary calculations using filtered transactions
+  const summary = useMemo(() => {
+    const income = filteredTransactions
+      .filter(t => t.type === "income")
+      .reduce((sum, t) => sum + (t.amount || 0), 0);
+    
+    const expense = filteredTransactions
+      .filter(t => t.type === "expense")
+      .reduce((sum, t) => sum + (t.amount || 0), 0);
+    
+    const balance = income - expense;
+    const savingsRate = income > 0 ? (balance / income) * 100 : 0;
+
+    return { income, expense, balance, savingsRate };
+  }, [filteredTransactions]);
+
+  // 💵 Format filtered transactions
+  const formattedTransactions = useMemo(() =>
+    filteredTransactions.map(tx => ({
       ...tx,
-      amountFormatted: format(tx.amount), // Updated: use format
+      amountFormatted: format(tx.amount),
     })),
-    [transactions, format]
+    [filteredTransactions, format]
   );
+
+  // ⏱ Manual refresh with loading state
+  const [isSyncing, setIsSyncing] = useState(false);
+  const handleManualSync = async () => {
+    setIsSyncing(true);
+    toast.loading("🔄 Syncing M-Pesa...");
+    
+    try {
+      await syncMpesaTransactions();
+      toast.dismiss();
+      toast.success("✅ Sync completed!");
+    } catch (error) {
+      toast.dismiss();
+      toast.error("❌ Sync failed");
+    } finally {
+      setIsSyncing(false);
+    }
+  };
 
   // AI Insights Handler with proper error handling
   const handleGenerateInsights = async () => {
+    if (filteredTransactions.length === 0) {
+      setAIError("No transactions available to analyze.");
+      toast.error("Add transactions to generate insights");
+      return;
+    }
+
     setAILoading(true);
     setAIError("");
     setAIInsights(null);
     
     try {
-      const insightsData = await generateAIInsights(transactions, currency);
-      console.log("AI Insights Response:", insightsData);
+      const insightsData = await generateAIInsights(filteredTransactions, currency);
       
       if (insightsData) {
-        // Build comprehensive insights using all available data
-        const trendsContent = [
-          insightsData.spending_overview,
-          insightsData.trend_analysis
-        ].filter(text => text && text.trim() !== '').join('\n\n');
-
-        const tipsContent = [
-          ...(insightsData.recommendations || []),
-          ...(insightsData.alerts || [])
-        ].filter(tip => tip && tip.trim() !== '');
-
-        const summaryContent = insightsData.savings_analysis;
-
         const transformedInsights = {
-          trends: trendsContent || "No trend analysis available for your transactions.",
-          tips: tipsContent.length > 0 ? `• ${tipsContent.join('\n• ')}` : "No specific recommendations available at this time.",
-          summary: summaryContent || "No summary analysis available."
+          trends: insightsData.spending_overview || insightsData.trend_analysis || "No trend analysis available.",
+          tips: Array.isArray(insightsData.recommendations) 
+            ? `• ${insightsData.recommendations.join('\n• ')}`
+            : "No specific recommendations available at this time.",
+          summary: insightsData.savings_analysis || "No summary analysis available.",
         };
         
-        console.log("Final Insights to Display:", transformedInsights);
         setAIInsights(transformedInsights);
+        toast.success("AI insights generated successfully!");
       } else {
-        setAIError("No insights data received from AI service.");
+        setAIError("No insights data received.");
       }
     } catch (err) {
       const errorMessage = err.message || "Failed to generate insights. Please try again.";
@@ -128,63 +230,73 @@ export default function TransactionsDashboard() {
   };
 
   const toggleSection = (section) => {
-    setExpanded((prev) => ({ ...prev, [section]: !prev[section] }));
+    setExpanded(prev => ({ ...prev, [section]: !prev[section] }));
   };
 
   const handleExportPDF = () => {
     if (!aiInsights) return;
     
     const doc = new jsPDF();
+    let yPosition = 20;
     
     // Header
     doc.setFont("helvetica", "bold");
-    doc.setTextColor(79, 70, 229); // Indigo color
+    doc.setTextColor(79, 70, 229);
     doc.setFontSize(18);
-    doc.text("AI Financial Insights Report", 14, 20);
-    
+    doc.text("AI Financial Insights Report", 14, yPosition);
+    yPosition += 15;
+
     // Date and details
     doc.setFont("helvetica", "normal");
-    doc.setTextColor(100, 116, 139); // Slate color
+    doc.setTextColor(100, 116, 139);
     doc.setFontSize(10);
-    doc.text(`Generated on: ${new Date().toLocaleDateString()}`, 14, 30);
-    doc.text(`Currency: ${currency.toUpperCase()}`, 14, 36);
-    
-    // Insights content
-    doc.setFontSize(12);
-    doc.setTextColor(15, 23, 42); // Dark slate
-    
-    let startY = 50;
-    
-    // Trends section
-    doc.setFont("helvetica", "bold");
-    doc.text("Spending Trends", 14, startY);
-    doc.setFont("helvetica", "normal");
-    const trendsLines = doc.splitTextToSize(aiInsights.trends || "No trend data available.", 180);
-    doc.text(trendsLines, 14, startY + 8);
-    startY += trendsLines.length * 6 + 20;
-    
-    // Tips section
-    doc.setFont("helvetica", "bold");
-    doc.text("Improvement Tips", 14, startY);
-    doc.setFont("helvetica", "normal");
-    const tipsLines = doc.splitTextToSize(aiInsights.tips || "No tips available.", 180);
-    doc.text(tipsLines, 14, startY + 8);
-    startY += tipsLines.length * 6 + 20;
-    
-    // Summary section
-    doc.setFont("helvetica", "bold");
-    doc.text("Summary", 14, startY);
-    doc.setFont("helvetica", "normal");
-    const summaryLines = doc.splitTextToSize(aiInsights.summary || "No summary available.", 180);
-    doc.text(summaryLines, 14, startY + 8);
-    
+    doc.text(`Generated on: ${new Date().toLocaleDateString()}`, 14, yPosition);
+    yPosition += 6;
+    doc.text(`Currency: ${currency.toUpperCase()}`, 14, yPosition);
+    yPosition += 6;
+    doc.text(`Transactions Analyzed: ${filteredTransactions.length}`, 14, yPosition);
+    yPosition += 15;
+
+    // Helper function to add section
+    const addSection = (title, content) => {
+      doc.setFont("helvetica", "bold");
+      doc.setTextColor(15, 23, 42);
+      doc.setFontSize(12);
+      doc.text(title, 14, yPosition);
+      yPosition += 8;
+
+      doc.setFont("helvetica", "normal");
+      const lines = doc.splitTextToSize(content || "No data available.", 180);
+      doc.text(lines, 14, yPosition);
+      yPosition += lines.length * 6 + 15;
+
+      // Page break check
+      if (yPosition > 250) {
+        doc.addPage();
+        yPosition = 20;
+      }
+    };
+
+    // Add insights sections
+    addSection("📈 Spending Trends", aiInsights.trends);
+    addSection("💡 Smart Recommendations", aiInsights.tips);
+    addSection("🏦 Financial Summary", aiInsights.summary);
+
     // Footer
     doc.setFontSize(8);
     doc.setTextColor(148, 163, 184);
     doc.text("Generated by FinTrack AI Assistant", 14, doc.internal.pageSize.height - 10);
     
     doc.save("AI_Financial_Insights_Report.pdf");
+    toast.success("PDF report downloaded!");
   };
+
+  // Navigation items for cleaner code
+  const navItems = [
+    { key: "dashboard", label: "Dashboard", icon: BarChart3 },
+    { key: "transactions", label: "Transactions", icon: ListOrdered },
+    { key: "settings", label: "Settings", icon: Settings },
+  ];
 
   return (
     <div className="min-h-screen bg-slate-50 dark:bg-slate-900 text-slate-800 dark:text-slate-100 flex flex-col">
@@ -197,21 +309,21 @@ export default function TransactionsDashboard() {
           <div className="flex flex-wrap gap-6 text-sm sm:text-base">
             <SummaryItem
               label="Balance"
-              value={format(summary.balance)} // Updated: use format
+              value={format(summary.balance)}
               color="text-indigo-500"
               icon={<Wallet className="w-4 h-4" />}
               onClick={() => setShowInsight("balance")}
             />
             <SummaryItem
               label="Income"
-              value={format(summary.income)} // Updated: use format
+              value={format(summary.income)}
               color="text-green-500"
               icon={<TrendingUp className="w-4 h-4" />}
               onClick={() => setShowInsight("income")}
             />
             <SummaryItem
               label="Expenses"
-              value={format(summary.expense)} // Updated: use format
+              value={format(summary.expense)}
               color="text-red-500"
               icon={<TrendingDown className="w-4 h-4" />}
               onClick={() => setShowInsight("expenses")}
@@ -228,29 +340,19 @@ export default function TransactionsDashboard() {
 
       {/* Main Content */}
       <div className="flex-1 p-6 max-w-7xl mx-auto space-y-8">
+        {/* Navigation */}
         <nav className="bg-white dark:bg-slate-800 rounded-2xl shadow-md p-4 sticky top-16 z-20">
           <div className="flex flex-wrap justify-center sm:justify-start gap-4">
-            <Button
-              onClick={() => setView("dashboard")}
-              variant={view === "dashboard" ? "default" : "outline"}
-              className="flex items-center gap-2"
-            >
-              <BarChart3 className="w-4 h-4" /> Dashboard
-            </Button>
-            <Button
-              onClick={() => setView("transactions")}
-              variant={view === "transactions" ? "default" : "outline"}
-              className="flex items-center gap-2"
-            >
-              <ListOrdered className="w-4 h-4" /> Transactions
-            </Button>
-            <Button
-              onClick={() => setView("settings")}
-              variant={view === "settings" ? "default" : "outline"}
-              className="flex items-center gap-2"
-            >
-              <Settings className="w-4 h-4" /> Settings
-            </Button>
+            {navItems.map(({ key, label, icon: Icon }) => (
+              <Button
+                key={key}
+                onClick={() => setView(key)}
+                variant={view === key ? "default" : "outline"}
+                className="flex items-center gap-2"
+              >
+                <Icon className="w-4 h-4" /> {label}
+              </Button>
+            ))}
             <Button
               onClick={() => setShowAddModal(true)}
               className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white ml-auto"
@@ -263,154 +365,110 @@ export default function TransactionsDashboard() {
         {/* View Content */}
         {view === "dashboard" && (
           <div className="space-y-8">
-            {/* Add Budget Alerts at the top */}
+            {/* Date Range Filter */}
+            <Card className="rounded-2xl shadow-md border border-slate-200 dark:border-slate-700">
+              <CardContent className="p-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Filter className="w-4 h-4 text-slate-500" />
+                    <span className="text-sm font-medium text-slate-700 dark:text-slate-300">
+                      Filter by Date Range:
+                    </span>
+                  </div>
+                  <select
+                    value={dateRange}
+                    onChange={(e) => setDateRange(e.target.value)}
+                    className="bg-white dark:bg-slate-700 border border-slate-300 dark:border-slate-600 rounded-lg px-3 py-1 text-sm text-slate-700 dark:text-slate-300 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+                  >
+                    <option value="all" className="text-slate-700 dark:text-slate-300">All Time</option>
+                    <option value="week" className="text-slate-700 dark:text-slate-300">Past Week</option>
+                    <option value="month" className="text-slate-700 dark:text-slate-300">Past Month</option>
+                    <option value="year" className="text-slate-700 dark:text-slate-300">Past Year</option>
+                  </select>
+                </div>
+              </CardContent>
+            </Card>
+
+            {/* Budget Alerts */}
             <BudgetAlerts 
-              transactions={transactions}
+              transactions={filteredTransactions}
               spendingCaps={spendingCaps}
               currency={currency}
-              format={format} // Pass format function instead of rate
+              format={format}
               userId={user?.id}
             />
             
+            {/* M-Pesa Activity Card */}
+            <Card className="rounded-2xl shadow-md border border-slate-200 dark:border-slate-700">
+              <CardContent className="p-4">
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className="text-lg font-medium flex items-center gap-2 text-slate-800 dark:text-slate-200">
+                    <Phone className="w-5 h-5 text-green-600" />
+                    Live M-Pesa Feed
+                  </h3>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={handleManualSync}
+                      disabled={isSyncing}
+                      className="flex items-center gap-1"
+                    >
+                      <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin' : ''}`} />
+                      {isSyncing ? "Syncing..." : "Sync"}
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => toggleSection("mpesa")}
+                    >
+                      {expanded.mpesa ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                    </Button>
+                  </div>
+                </div>
+
+                {expanded.mpesa && (
+                  <div className="space-y-3">
+                    {mpesaTransactions.length > 0 ? (
+                      mpesaTransactions.map((tx) => (
+                        <MpesaTransactionItem key={tx.id} transaction={tx} format={format} />
+                      ))
+                    ) : (
+                      <p className="text-slate-500 dark:text-slate-400 text-sm italic text-center py-4">
+                        No M-Pesa transactions synced yet.
+                      </p>
+                    )}
+                    
+                    <div className="text-xs text-slate-400 dark:text-slate-500 text-right mt-3 pt-2 border-t border-slate-100 dark:border-slate-700">
+                      Last sync: {lastSync ? lastSync.toLocaleTimeString() : "Not synced yet"}
+                    </div>
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+
+            {/* Dashboard View with Charts */}
             <DashboardView
               transactions={formattedTransactions}
               savingsGoal={savingsGoal}
               loading={loading}
               error={error}
               currency={currency}
-              format={format} // Pass format function instead of rate
+              format={format}
             />
             
-            {/* 🧠 AI INSIGHTS PANEL */}
-            <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-lg border border-indigo-100 dark:border-slate-700">
-              <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <Brain className="w-6 h-6 text-indigo-600 dark:text-indigo-400" />
-                  <h2 className="text-xl font-semibold text-slate-800 dark:text-slate-100">
-                    AI Financial Assistant
-                  </h2>
-                </div>
-                {aiInsights && (
-                  <Button
-                    onClick={handleExportPDF}
-                    variant="outline"
-                    size="sm"
-                    className="flex items-center gap-2"
-                  >
-                    <FileDown className="w-4 h-4" /> Export PDF
-                  </Button>
-                )}
-              </div>
-
-              <div className="p-6">
-                <p className="text-sm text-slate-600 dark:text-slate-400 mb-6">
-                  Let AI analyze your spending and income patterns for deeper financial insight.
-                </p>
-
-                <Button
-                  onClick={handleGenerateInsights}
-                  disabled={aiLoading || transactions.length === 0}
-                  className="bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-2 mb-6"
-                >
-                  {aiLoading ? (
-                    <>
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                      Generating Insights...
-                    </>
-                  ) : (
-                    <>
-                      <Brain className="w-4 h-4" />
-                      Generate AI Insights
-                    </>
-                  )}
-                </Button>
-
-                {transactions.length === 0 && (
-                  <p className="text-sm text-slate-500 dark:text-slate-400">
-                    Add some transactions to generate AI insights.
-                  </p>
-                )}
-
-                {/* Error Display */}
-                {aiError && (
-                  <motion.div 
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    className="mb-6 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl"
-                  >
-                    <div className="flex items-center gap-2 text-red-700 dark:text-red-400">
-                      <AlertCircle className="w-4 h-4" />
-                      <strong>Error:</strong> {aiError}
-                    </div>
-                  </motion.div>
-                )}
-
-                {aiInsights && (
-                  <motion.div 
-                    initial={{ opacity: 0, y: 10 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    transition={{ duration: 0.3 }}
-                    className="space-y-4"
-                  >
-                    {/* TRENDS */}
-                    <div className="bg-gradient-to-br from-indigo-50 to-white dark:from-slate-800 dark:to-slate-900 rounded-xl p-4 border border-indigo-100 dark:border-slate-700">
-                      <div
-                        onClick={() => toggleSection("trends")}
-                        className="flex justify-between items-center cursor-pointer mb-2"
-                      >
-                        <h4 className="font-semibold flex items-center gap-2 text-indigo-600 dark:text-indigo-400">
-                          <Lightbulb className="w-5 h-5" /> Spending Trends
-                        </h4>
-                        {expanded.trends ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                      </div>
-                      {expanded.trends && (
-                        <p className="text-sm text-slate-700 dark:text-slate-200 whitespace-pre-wrap">
-                          {aiInsights.trends || "No trend data available."}
-                        </p>
-                      )}
-                    </div>
-
-                    {/* TIPS */}
-                    <div className="bg-gradient-to-br from-green-50 to-white dark:from-slate-800 dark:to-slate-900 rounded-xl p-4 border border-green-100 dark:border-slate-700">
-                      <div
-                        onClick={() => toggleSection("tips")}
-                        className="flex justify-between items-center cursor-pointer mb-2"
-                      >
-                        <h4 className="font-semibold flex items-center gap-2 text-green-600 dark:text-green-400">
-                          <Lightbulb className="w-5 h-5" /> Improvement Tips
-                        </h4>
-                        {expanded.tips ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                      </div>
-                      {expanded.tips && (
-                        <p className="text-sm text-slate-700 dark:text-slate-200 whitespace-pre-wrap">
-                          {aiInsights.tips || "No tips available."}
-                        </p>
-                      )}
-                    </div>
-
-                    {/* SUMMARY */}
-                    <div className="bg-gradient-to-br from-slate-50 to-white dark:from-slate-800 dark:to-slate-900 rounded-xl p-4 border border-slate-200 dark:border-slate-700">
-                      <div
-                        onClick={() => toggleSection("summary")}
-                        className="flex justify-between items-center cursor-pointer mb-2"
-                      >
-                        <h4 className="font-semibold flex items-center gap-2 text-slate-600 dark:text-slate-400">
-                          <Lightbulb className="w-5 h-5" /> Summary
-                        </h4>
-                        {expanded.summary ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-                      </div>
-                      {expanded.summary && (
-                        <p className="text-sm text-slate-700 dark:text-slate-200 whitespace-pre-wrap">
-                          {aiInsights.summary || "No summary available."}
-                        </p>
-                      )}
-                    </div>
-                  </motion.div>
-                )}
-              </div>
-            </div>
+            {/* AI Insights Panel */}
+            <AIInsightsPanel
+              aiInsights={aiInsights}
+              aiLoading={aiLoading}
+              aiError={aiError}
+              transactionsCount={filteredTransactions.length}
+              expanded={expanded}
+              onToggleSection={toggleSection}
+              onGenerateInsights={handleGenerateInsights}
+              onExportPDF={handleExportPDF}
+            />
           </div>
-          
         )}
         
         {view === "transactions" && (
@@ -453,7 +511,7 @@ export default function TransactionsDashboard() {
             type={showInsight}
             summary={summary}
             currency={currency}
-            format={format} // Pass format function instead of rate
+            format={format}
             onClose={() => setShowInsight(null)}
           />
         )}
@@ -462,7 +520,7 @@ export default function TransactionsDashboard() {
   );
 }
 
-// Summary Item Component
+// Sub-components for better organization
 const SummaryItem = ({ label, value, color, icon, onClick }) => (
   <button
     onClick={onClick}
@@ -476,11 +534,171 @@ const SummaryItem = ({ label, value, color, icon, onClick }) => (
   </button>
 );
 
-// Insight Modal Component - Updated to use format function
+const MpesaTransactionItem = ({ transaction, format }) => (
+  <div className="flex justify-between items-center p-3 bg-slate-50 dark:bg-slate-800 rounded-lg border border-slate-200 dark:border-slate-700">
+    <div className="flex-1">
+      <p className="font-medium text-sm text-slate-800 dark:text-slate-200">{transaction.name || "M-Pesa Payment"}</p>
+      <p className="text-xs text-slate-500 dark:text-slate-400 flex items-center gap-1">
+        <Clock className="w-3 h-3" />
+        {new Date(transaction.date).toLocaleString()}
+      </p>
+      <p className="text-xs text-slate-400 dark:text-slate-500 capitalize">
+        {transaction.transaction_type || "General"}
+      </p>
+    </div>
+    <span
+      className={`font-semibold text-sm flex items-center gap-1 ${
+        transaction.type === "income" ? "text-green-600" : "text-red-600"
+      }`}
+    >
+      {transaction.type === "income" ? (
+        <ArrowDownCircle className="w-4 h-4" />
+      ) : (
+        <ArrowUpCircle className="w-4 h-4" />
+      )}
+      {format(transaction.amount)}
+    </span>
+  </div>
+);
+
+const AIInsightsPanel = ({ 
+  aiInsights, 
+  aiLoading, 
+  aiError, 
+  transactionsCount, 
+  expanded, 
+  onToggleSection, 
+  onGenerateInsights, 
+  onExportPDF 
+}) => (
+  <div className="bg-white dark:bg-slate-800 rounded-2xl shadow-lg border border-indigo-100 dark:border-slate-700">
+    <div className="p-6 border-b border-slate-200 dark:border-slate-700 flex items-center justify-between">
+      <div className="flex items-center gap-3">
+        <Brain className="w-6 h-6 text-indigo-600 dark:text-indigo-400" />
+        <h2 className="text-xl font-semibold text-slate-800 dark:text-slate-100">
+          AI Financial Assistant
+        </h2>
+      </div>
+      {aiInsights && (
+        <Button
+          onClick={onExportPDF}
+          variant="outline"
+          size="sm"
+          className="flex items-center gap-2"
+        >
+          <FileDown className="w-4 h-4" /> Export PDF
+        </Button>
+      )}
+    </div>
+
+    <div className="p-6">
+      <p className="text-sm text-slate-600 dark:text-slate-400 mb-6">
+        Let AI analyze your spending and income patterns for deeper financial insight.
+      </p>
+
+      <Button
+        onClick={onGenerateInsights}
+        disabled={aiLoading || transactionsCount === 0}
+        className="bg-indigo-600 hover:bg-indigo-700 text-white flex items-center gap-2 mb-6"
+      >
+        {aiLoading ? (
+          <>
+            <Loader2 className="w-4 h-4 animate-spin" />
+            Generating Insights...
+          </>
+        ) : (
+          <>
+            <Brain className="w-4 h-4" />
+            Generate AI Insights
+          </>
+        )}
+      </Button>
+
+      {transactionsCount === 0 && (
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          Add some transactions to generate AI insights.
+        </p>
+      )}
+
+      {aiError && (
+        <motion.div 
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="mb-6 p-4 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-xl"
+        >
+          <div className="flex items-center gap-2 text-red-700 dark:text-red-400">
+            <AlertCircle className="w-4 h-4" />
+            <strong>Error:</strong> {aiError}
+          </div>
+        </motion.div>
+      )}
+
+      {aiInsights && (
+        <motion.div 
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3 }}
+          className="space-y-4"
+        >
+          <InsightSection
+            title="Spending Trends"
+            content={aiInsights.trends}
+            expanded={expanded.trends}
+            onToggle={() => onToggleSection("trends")}
+            color="indigo"
+          />
+          <InsightSection
+            title="Improvement Tips"
+            content={aiInsights.tips}
+            expanded={expanded.tips}
+            onToggle={() => onToggleSection("tips")}
+            color="green"
+          />
+          <InsightSection
+            title="Summary"
+            content={aiInsights.summary}
+            expanded={expanded.summary}
+            onToggle={() => onToggleSection("summary")}
+            color="slate"
+          />
+        </motion.div>
+      )}
+    </div>
+  </div>
+);
+
+const InsightSection = ({ title, content, expanded, onToggle, color }) => {
+  const colorClasses = {
+    indigo: "from-indigo-50 to-white border-indigo-100 text-indigo-600 dark:from-slate-800 dark:to-slate-900 dark:border-slate-700 dark:text-indigo-400",
+    green: "from-green-50 to-white border-green-100 text-green-600 dark:from-slate-800 dark:to-slate-900 dark:border-slate-700 dark:text-green-400",
+    slate: "from-slate-50 to-white border-slate-200 text-slate-600 dark:from-slate-800 dark:to-slate-900 dark:border-slate-700 dark:text-slate-400"
+  };
+
+  return (
+    <div className={`bg-gradient-to-br rounded-xl p-4 border ${colorClasses[color]}`}>
+      <div
+        onClick={onToggle}
+        className="flex justify-between items-center cursor-pointer mb-2"
+      >
+        <h4 className="font-semibold flex items-center gap-2">
+          <Lightbulb className="w-5 h-5" /> {title}
+        </h4>
+        {expanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+      </div>
+      {expanded && (
+        <p className="text-sm text-slate-700 dark:text-slate-200 whitespace-pre-wrap">
+          {content}
+        </p>
+      )}
+    </div>
+  );
+};
+
+// Insight Modal Component
 const InsightModal = ({ type, summary, currency, format, onClose }) => {
   const titleMap = {
     balance: "Balance Overview",
-    income: "Income Breakdown",
+    income: "Income Breakdown", 
     expenses: "Expense Breakdown",
   };
 
@@ -526,7 +744,7 @@ const InsightModal = ({ type, summary, currency, format, onClose }) => {
         {/* Value Display */}
         <div className="text-center py-2">
           <p className="text-4xl font-bold text-slate-800 dark:text-slate-100">
-            {format(amount)} {/* Updated: use format */}
+            {format(amount)}
           </p>
           <p className="text-sm text-slate-500 dark:text-slate-400 mt-1">
             Based on your transactions in {currency.toUpperCase()}
@@ -548,7 +766,7 @@ const InsightModal = ({ type, summary, currency, format, onClose }) => {
                 className="text-slate-600 dark:text-slate-400"
               />
               <Tooltip
-                formatter={(val) => format(val)} // Updated: use format
+                formatter={(val) => format(val)}
                 labelStyle={{ color: "#64748b" }}
                 contentStyle={{ 
                   backgroundColor: 'white',
@@ -592,4 +810,4 @@ const InsightModal = ({ type, summary, currency, format, onClose }) => {
       </motion.div>
     </motion.div>
   );
-}
+};

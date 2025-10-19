@@ -7,10 +7,12 @@ import MainDashboard from "@/pages/transactions/MainDashboard";
 import AnalyticsDashboard from "@/pages/analytics/AnalyticsDashboard";
 import DashboardLayout from "@/layouts/DashboardLayout";
 import Profile from "@/pages/Profile";
-import Settings from "@/pages/settings/Settings";
+import SettingsView from "@/pages/settings/SettingsView"; 
 import InsightsDashboard from "@/pages/ai/InsightsDashboard";
 // import TransactionsView from "./pages/transactions/TransactionsView";
 import TransactionsPage from "./pages/transactions/TransactionsPage";
+import ConnectPlaid from "@/pages/bank/ConnectPlaid";
+
 
 const PrivateRoute = ({ children }) => {
   const { user, loading } = useAuth();
@@ -39,25 +41,17 @@ function App() {
             <Route path="/dashboard" element={<MainDashboard />} />
             <Route path="/analytics" element={<AnalyticsDashboard />} />
             <Route path="/transactions" element={<TransactionsPage />} />
+            <Route path="/settings" element={<SettingsView />} /> 
           </Route>
           
           {/* Redirect */}
-          <Route path="*" element={<Navigate to="/dashboard" />} />
+          <Route path="*" element={<Navigate to="/login" />} />
           
           <Route
             path="/profile"
             element={
               <PrivateRoute>
                 <Profile />
-              </PrivateRoute>
-            }
-          />
-          
-          <Route
-            path="/settings"
-            element={
-              <PrivateRoute>
-                <Settings />
               </PrivateRoute>
             }
           />
@@ -70,6 +64,7 @@ function App() {
               </PrivateRoute>
             }
           />
+          <Route path="/bank/connect" element={<ConnectPlaid />} />
         </Routes>
       </Router>
       

@@ -22,11 +22,6 @@ export default function TransactionsPage() {
   const [showAddModal, setShowAddModal] = useState(false);
   const [editTx, setEditTx] = useState(null);
 
-  /**
-   * Handlers and Logic
-   * Use `useCallback` to prevent unnecessary re-renders of child components.
-   * Modals now handle the actual API calls and close themselves upon success.
-   */
 
   // Open/Close handlers for modals (kept simple for direct state manipulation)
   const handleAddOpen = useCallback(() => setShowAddModal(true), []);
