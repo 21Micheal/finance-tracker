@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Optional
 from datetime import datetime
@@ -7,7 +7,14 @@ import numpy as np
 import pandas as pd
 from uuid import UUID
 from typing import Union
+# Removed sklearn dependency and use numpy.polyfit for simple linear regression fallback
+from sqlalchemy.orm import Session
+from app.db.session import get_db
+from app.models.transaction import Transaction
+from prophet import Prophet
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["AI Insights"])
 
 # ---------- Models ----------
@@ -188,3 +195,129 @@ async def ai_spending_trends(request: AIRequest):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Trend Analysis Error: {e}")
+
+
+@router.get("/predict-insights")
+def predict_insights(user_id: str, db: Session = Depends(get_db)):
+    transactions = db.query(Transaction).filter(Transaction.user_id == user_id).all()
+    if not transactions:
+        raise HTTPException(status_code=404, detail="No transactions found")
+
+    # Convert to DataFrame
+    df = pd.DataFrame([{
+        "amount": t.amount,
+        "type": t.type,
+        "date": t.date
+    } for t in transactions])
+
+    df["month"] = df["date"].dt.to_period("M").astype(str)
+
+    monthly_summary = (
+        df.groupby(["month", "type"])["amount"].sum().unstack(fill_value=0)
+    ).reset_index()
+
+    monthly_summary["savings"] = monthly_summary.get("income", 0) - monthly_summary.get("expense", 0)
+
+    # Prepare regression model using numpy.polyfit as a lightweight fallback to sklearn
+    months_numeric = np.arange(len(monthly_summary))
+
+    def forecast(column):
+        # safe extraction and dtype cast
+        y = monthly_summary[column].values.astype(float)
+        if len(y) == 0:
+            return [0.0, 0.0, 0.0]
+        if len(y) == 1:
+            # not enough points to fit a line; repeat the known value
+            return [float(y[0]), float(y[0]), float(y[0])]
+
+        # Fit a simple linear model (degree 1) and predict next 3 periods
+        try:
+            slope, intercept = np.polyfit(months_numeric, y, 1)
+        except Exception:
+            # fallback to constant prediction on failure
+            return [float(y[-1]), float(y[-1]), float(y[-1])]
+
+        future_x = months_numeric[-1] + np.arange(1, 4)
+        future_y = intercept + slope * future_x
+        return [float(v) for v in future_y]
+
+    future_income = forecast("income") if "income" in monthly_summary.columns else [0.0, 0.0, 0.0]
+    future_expense = forecast("expense") if "expense" in monthly_summary.columns else [0.0, 0.0, 0.0]
+    future_savings = [i - e for i, e in zip(future_income, future_expense)]
+
+    return {
+        "history": monthly_summary.to_dict(orient="records"),
+        "forecast": {
+            "months_ahead": ["Next 1 Month", "Next 2 Months", "Next 3 Months"],
+            "income": future_income,
+            "expense": future_expense,
+            "savings": future_savings
+        }
+    }
+
+@router.get("/predict")
+async def predict_financial_trends(user_id: int, db: Session = Depends(get_db)):
+    """
+    Predicts next 3 months of income, expenses, and savings using Prophet model.
+    Handles seasonality, trends, and anomalies.
+    """
+    try:
+        transactions = db.query(Transaction).filter(Transaction.user_id == user_id).all()
+        if not transactions:
+            raise HTTPException(status_code=404, detail="No transactions found for prediction")
+
+        df = pd.DataFrame([{
+            "date": t.date,
+            "amount": t.amount,
+            "type": t.type
+        } for t in transactions])
+
+        df["date"] = pd.to_datetime(df["date"])
+        df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
+
+        # Aggregate income, expense, and savings by month
+        monthly = (
+            df.groupby(["month", "type"])["amount"]
+            .sum()
+            .unstack(fill_value=0)
+            .reset_index()
+        )
+        monthly["income"] = monthly.get("income", 0)
+        monthly["expense"] = monthly.get("expense", 0)
+        monthly["savings"] = monthly["income"] - monthly["expense"]
+
+        forecasts = {}
+
+        def prophet_forecast(series_name):
+            sub_df = pd.DataFrame({
+                "ds": monthly["month"],
+                "y": monthly[series_name]
+            })
+            model = Prophet(seasonality_mode="additive")
+            model.fit(sub_df)
+            future = model.make_future_dataframe(periods=3, freq="M")
+            forecast = model.predict(future)
+            result = forecast[["ds", "yhat"]].tail(3)
+            return result
+
+        # Forecast each metric
+        for metric in ["income", "expense", "savings"]:
+            forecasts[metric] = prophet_forecast(metric)
+
+        # Combine results
+        months = forecasts["income"]["ds"].dt.strftime("%Y-%m").tolist()
+        forecast = [
+            {
+                "month": m,
+                "income": float(forecasts["income"].iloc[i]["yhat"]),
+                "expense": float(forecasts["expense"].iloc[i]["yhat"]),
+                "savings": float(forecasts["savings"].iloc[i]["yhat"]),
+            }
+            for i, m in enumerate(months)
+        ]
+
+        return {"forecast": forecast}
+
+    except Exception as e:
+        logger.error(f"Prediction error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))

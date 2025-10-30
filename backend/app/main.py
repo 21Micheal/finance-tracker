@@ -5,8 +5,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.encoders import jsonable_encoder
 from app.api.routes import transaction_routes, webhook_routes
 from app.api.routes.bank import router as bank_router 
-# from app.api.routes import mpesa_routes
+from app.api.routes import goals 
 from app.api.routes import ai_routes
+from app.api.routes import alerts
+from app.api.routes import insights
 from app.config import settings
 import uvicorn
 import logging
@@ -48,7 +50,15 @@ origins = [
     "http://localhost:5173",   # Vite dev server
     "http://127.0.0.1:5173",   # Vite dev server alternative
     "http://localhost:3000",   # Create React App dev server
-    "http://127.0.0.1:3000",   # CRA alternative
+    "http://127.0.0.1:3000", 
+    "http://localhost:8081",   # Expo web
+    "http://127.0.0.1:8081",   # Alternate Expo web
+    "http://localhost:19006",  # Expo old web port
+    "http://127.0.0.1:19006",  # Alternate
+    "http://localhost:8000",   # In case of same-port testing
+    "http://127.0.0.1:8000", 
+    "http://localhost",
+    "http://127.0.0.1", # CRA alternative
     "https://your-frontend-domain.com",  # production
     # Add more as needed
 ]
@@ -59,7 +69,8 @@ if os.getenv("ENVIRONMENT") == "development":
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],  # For development, restrict in production
+    #allow_origins=origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     allow_headers=["*"],
@@ -112,6 +123,9 @@ app.include_router(bank_router, prefix="/api")
 app.include_router(transaction_routes.router, prefix="/api", tags=["Transactions"])
 app.include_router(webhook_routes.router)
 app.include_router(ai_routes.router)
+app.include_router(alerts.router)
+app.include_router(insights.router)
+app.include_router(goals.router)
 
 # Conditionally include M-Pesa routes if configured
 # if getattr(settings, 'MPESA_ENABLED', False):
