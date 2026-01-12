@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
+from typing import Optional, Literal
 from sqlalchemy.orm import Session
 import httpx
 from app.config import settings
@@ -9,6 +11,7 @@ from datetime import datetime
 import logging
 import json
 from app.api.deps import get_current_user 
+from app.models.transaction import User
 from app.core.supabase_client import get_supabase_admin
 import re
 
@@ -18,6 +21,89 @@ logger = logging.getLogger(__name__)
 
 # Create a router with prefix and tags
 router = APIRouter(tags=["Transactions"])
+
+def classify_transaction(transaction: dict) -> str:
+    """
+    Comprehensive transaction classification.
+    """
+    # Check existing type
+    if transaction.get('type') in ['income', 'expense']:
+        return transaction['type']
+    
+    # Check category first (most reliable for your data)
+    category = (transaction.get('category') or '').lower()
+    
+    # Definitely expense categories
+    expense_categories = [
+        'shopping', 'food', 'transport', 'entertainment',
+        'bills', 'utilities', 'rent', 'groceries',
+        'dining', 'travel', 'subscriptions', 'shopping',
+        'retail', 'supermarket', 'mall'
+    ]
+    
+    for expense_cat in expense_categories:
+        if expense_cat in category:
+            return 'expense'
+    
+    # Income categories
+    income_categories = [
+        'salary', 'freelance', 'business', 'investment',
+        'refund', 'bonus', 'gift', 'dividend', 'payment'
+    ]
+    
+    for income_cat in income_categories:
+        if income_cat in category:
+            return 'income'
+    
+    # Check description
+    description = (transaction.get('description') or '').lower()
+    if any(word in description for word in ['received', 'from', 'credited', 'deposit']):
+        return 'income'
+    
+    if any(word in description for word in ['sent to', 'paid to', 'withdraw', 'purchase', 'shopping']):
+        return 'expense'
+    
+    # Default: category-based heuristic
+    # Shopping-like categories are expenses
+    if 'shop' in category or 'store' in category or 'market' in category:
+        return 'expense'
+    
+    # Most transactions are expenses
+    return 'expense'
+
+def determine_mpesa_transaction_type(transaction_type: str, amount: float) -> str:
+    """
+    Determine if M-Pesa transaction is income or expense based on transaction type.
+    """
+    transaction_type_lower = transaction_type.lower()
+    
+    # Income transactions
+    if any(word in transaction_type_lower for word in [
+        "deposit", "receive", "credit", "from", 
+        "payment received", "money received"
+    ]):
+        return "income"
+    
+    # Expense transactions  
+    if any(word in transaction_type_lower for word in [
+        "withdrawal", "send", "payment", "pay bill", 
+        "buy goods", "airtime", "transfer", "sent to",
+        "paid to", "purchase"
+    ]):
+        return "expense"
+    
+    # Default based on common patterns
+    # Pay Bill transactions are usually expenses
+    if "pay bill" in transaction_type_lower:
+        return "expense"
+    
+    # Receiving money is usually income
+    if "received" in transaction_type_lower:
+        return "income"
+    
+    # If we can't determine, use a safer default
+    # Most M-Pesa transactions are expenses (payments)
+    return "expense"
 
 @router.post("/mpesa/callback")
 async def mpesa_callback(request: Request, db: Session = Depends(get_db)):
@@ -33,7 +119,7 @@ async def mpesa_callback(request: Request, db: Session = Depends(get_db)):
         trans_time = data.get("TransTime", datetime.utcnow().strftime("%Y%m%d%H%M%S"))
         phone_number = data.get("MSISDN", "").strip()
         name = data.get("FirstName", "M-Pesa User")
-        trans_type = data.get("TransactionType", "Pay Bill")
+        transaction_type = data.get("TransactionType", "Pay Bill")  # Changed variable name to avoid conflict
 
         # Parse timestamp safely
         try:
@@ -51,6 +137,9 @@ async def mpesa_callback(request: Request, db: Session = Depends(get_db)):
         user = db.query(User).filter(User.phone == phone_number).first()
         user_id = user.id if user else None
 
+        # ✅ FIXED: Determine transaction type properly
+        transaction_category = determine_mpesa_transaction_type(transaction_type, amount)
+        
         # Create transaction
         new_txn = Transaction(
             name=name,
@@ -58,10 +147,10 @@ async def mpesa_callback(request: Request, db: Session = Depends(get_db)):
             date=timestamp.date(),
             category="M-Pesa",
             account_id=phone_number,
-            transaction_type=trans_type,
-            type="income" if amount > 0 else "expense",
+            transaction_type=transaction_type,  # Original M-Pesa transaction type
+            type=transaction_category,  # ✅ Now properly classified as income/expense
             source="mpesa",
-            description=f"M-Pesa {trans_type} (ID: {trans_id})",
+            description=f"M-Pesa {transaction_type} (ID: {trans_id})",
             user_id=user_id
         )
 
@@ -69,7 +158,8 @@ async def mpesa_callback(request: Request, db: Session = Depends(get_db)):
         db.commit()
         db.refresh(new_txn)
 
-        logger.info("✅ Saved M-Pesa transaction for %s (User: %s)", phone_number, user.email if user else "None")
+        logger.info("✅ Saved M-Pesa transaction for %s (User: %s, Type: %s)", 
+                   phone_number, user.email if user else "None", transaction_category)
 
         return {"ResultCode": 0, "ResultDesc": "Transaction received successfully"}
 
@@ -78,98 +168,119 @@ async def mpesa_callback(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-
-# In your FastAPI backend - update the transactions endpoint
 @router.get("/mpesa/transactions", response_model=list[TransactionResponse])
 async def get_mpesa_transactions(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Fetch all M-Pesa transactions for the current user.
+    Fetch all transactions for the current user with proper classification.
     """
     try:
         transactions = db.query(Transaction).filter(
             Transaction.user_id == current_user.id,
-            Transaction.source == "mpesa"
+            Transaction.source.in_(["mpesa", "sms"])
         ).order_by(Transaction.date.desc()).all()
         
-        logger.info("📱 Fetched %d M-Pesa transactions for user %s", len(transactions), current_user.id)
+        # ✅ Ensure all transactions are properly classified
+        for txn in transactions:
+            if not txn.type or txn.type not in ["income", "expense"]:
+                correct_type = classify_transaction(txn)
+                if txn.type != correct_type:
+                    txn.type = correct_type
+                    logger.debug(f"Reclassified transaction {txn.id} as {correct_type}")
+        
+        # Commit any reclassifications
+        db.commit()
+        
+        logger.info("📱 Fetched %d transactions for user %s", len(transactions), current_user.id)
+        
+        # Log classification summary
+        income_count = sum(1 for t in transactions if t.type == "income")
+        expense_count = sum(1 for t in transactions if t.type == "expense")
+        logger.info("📊 Classification: %d income, %d expense", income_count, expense_count)
+        
         return transactions
         
     except Exception as e:
-        logger.error("🔥 Error fetching M-Pesa transactions: %s", str(e))
+        logger.error("🔥 Error fetching transactions: %s", str(e))
         raise HTTPException(
             status_code=500, 
-            detail=f"Error fetching M-Pesa transactions: {str(e)}"
+            detail=f"Error fetching transactions: {str(e)}"
         )
 
 def parse_mpesa_message(sms: str) -> dict:
     """
-    Parses common M-Pesa transaction SMS formats.
-    Returns { amount, type, merchant, timestamp, reference, balance }
+    Robustly parses M-Pesa SMS formats, handling multi-part fragments 
+    and various transaction types.
     """
-    sms = sms.strip()
-    lower_sms = sms.lower()
-
-    # ✅ Common fields
-    reference_match = re.match(r"([A-Z0-9]{10})", sms)
+    # Clean up whitespace and newlines
+    sms = " ".join(sms.split()).strip()
+    
+    # 1. Extract Transaction Reference (10 alphanumeric chars)
+    # Using search instead of match because it might not be at index 0
+    reference_match = re.search(r"\b([A-Z0-9]{10})\b", sms)
     reference = reference_match.group(1) if reference_match else None
 
-    amount_match = re.search(r"Ksh\s?([\d,]+\.\d{2})", sms)
-    amount = float(amount_match.group(1).replace(",", "")) if amount_match else None
+    # 2. Extract Amount (Handles 'Ksh1.00', 'Ksh 1,200.00', etc.)
+    amount_match = re.search(r"Ksh\s?([\d,]+\.\d{2})", sms, re.IGNORECASE)
+    amount = float(amount_match.group(1).replace(",", "")) if amount_match else 0.0
 
-    balance_match = re.search(r"balance\s+is\s+Ksh\s?([\d,]+\.\d{2})", sms)
-    balance = float(balance_match.group(1).replace(",", "")) if balance_match else None
+    # 3. Extract Balance
+    balance_match = re.search(r"balance\s+is\s+Ksh\s?([\d,]+\.\d{2})", sms, re.IGNORECASE)
+    balance = float(balance_match.group(1).replace(",", "")) if balance_match else 0.0
 
-    # ✅ Extract date
-    date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{4})\s+at\s+(\d{1,2}:\d{2}\s?[APMapm]{2})", sms)
+    # 4. Extract Date/Time
+    # Pattern: 10/1/26 at 8:18 PM
+    timestamp = datetime.utcnow() # Default
+    date_match = re.search(r"(\d{1,2}/\d{1,2}/\d{2,4})\s+at\s+(\d{1,2}:\d{2}\s?[APMapm]{2})", sms)
     if date_match:
         try:
-            timestamp = datetime.strptime(
-                f"{date_match.group(1)} {date_match.group(2)}", "%d/%m/%Y %I:%M %p"
-            )
-        except ValueError:
-            timestamp = datetime.utcnow()
-    else:
-        timestamp = datetime.utcnow()
+            date_str = date_match.group(1)
+            time_str = date_match.group(2).replace(" ", "").upper()
+            # Handle 2-digit vs 4-digit years
+            year_fmt = "%y" if len(date_str.split('/')[-1]) == 2 else "%Y"
+            timestamp = datetime.strptime(f"{date_str} {time_str}", f"%d/%m/{year_fmt} %I:%M%p")
+        except Exception as e:
+            logger.warning(f"Failed to parse M-Pesa date: {e}")
 
-    # ✅ Classify transaction type
-    txn_type = "unknown"
-    merchant = "Unknown"
+    # 5. Classification & Merchant Extraction
+    txn_type = "expense"  # Default
+    merchant = "M-Pesa Transaction"
 
-    if "you have received" in lower_sms:
+    # Identify Type
+    is_received = re.search(r"received|credited", sms, re.IGNORECASE)
+    is_sent = re.search(r"sent to", sms, re.IGNORECASE)
+    is_paid = re.search(r"paid to|buy goods", sms, re.IGNORECASE)
+    is_withdraw = re.search(r"withdraw", sms, re.IGNORECASE)
+    is_fuliza = re.search(r"Fuliza", sms, re.IGNORECASE)
+
+    if is_received:
         txn_type = "income"
-        match = re.search(r"from\s([A-Z][A-Za-z0-9\s\.\-&]+)", sms)
-        merchant = match.group(1).strip() if match else "Sender"
-
-    elif "sent to" in lower_sms:
+        # Extract name after 'from' and before 'on' or '07...'
+        m = re.search(r"from\s+(.+?)\s+(?:on|(?:\d{10}))", sms, re.IGNORECASE)
+        merchant = m.group(1).strip() if m else "Sender"
+        
+    elif is_sent:
         txn_type = "expense"
-        match = re.search(r"sent to\s([A-Z][A-Za-z0-9\s\.\-&]+)", sms)
-        merchant = match.group(1).strip() if match else "Recipient"
-
-    elif "paid to" in lower_sms or "pay bill" in lower_sms:
+        # Extract name after 'sent to' and before 'on' or '07...'
+        m = re.search(r"sent to\s+(.+?)\s+(?:on|(?:\d{10}))", sms, re.IGNORECASE)
+        merchant = m.group(1).strip() if m else "Recipient"
+        
+    elif is_paid:
         txn_type = "expense"
-        match = re.search(r"(?:paid to|Pay Bill\s?[0-9\-]*\s?)([A-Z][A-Za-z0-9\s\.\-&]+)", sms)
-        merchant = match.group(1).strip() if match else "Pay Bill"
-
-    elif "buy goods" in lower_sms or "buy goods and services" in lower_sms:
+        # Extract name after 'paid to' or 'at'
+        m = re.search(r"(?:paid to|at)\s+(.+?)\s+on", sms, re.IGNORECASE)
+        merchant = m.group(1).strip() if m else "Merchant"
+        
+    elif is_withdraw:
         txn_type = "expense"
-        match = re.search(r"buy goods(?: and services)?\s?([A-Z][A-Za-z0-9\s\.\-&]*)", sms)
-        merchant = match.group(1).strip() if match else "Merchant"
+        m = re.search(r"at\s+(.+?)\s+on", sms, re.IGNORECASE)
+        merchant = f"Withdrawal: {m.group(1).strip()}" if m else "Agent Withdrawal"
 
-    elif "airtime" in lower_sms:
+    elif is_fuliza:
         txn_type = "expense"
-        merchant = "Airtime Purchase"
-
-    elif "reversed" in lower_sms:
-        txn_type = "reversal"
-        merchant = "M-Pesa Reversal"
-
-    else:
-        # Default fallback
-        txn_type = "other"
+        merchant = "Fuliza M-Pesa"
 
     return {
         "reference": reference,
@@ -178,244 +289,69 @@ def parse_mpesa_message(sms: str) -> dict:
         "timestamp": timestamp,
         "balance": balance,
         "type": txn_type,
+        "raw_text": sms
     }
 
+# Request schema for the mobile app
+class MpesaTransactionRequest(BaseModel):
+    tx_code: str
+    type: Literal["income", "expense"]
+    amount: float
+    counterparty: Optional[str] = None
+    phone: Optional[str] = None
+    balance: Optional[float] = None
+    cost: Optional[float] = None
+    occurred_at: datetime
+    raw_text: Optional[str] = None
 
-@router.post("/mpesa/sync")
-async def sync_mpesa_transactions(request: Request, db: Session = Depends(get_db)):
-    """
-    Receives raw SMS data from Android listener and logs parsed M-Pesa transactions.
-    """
+
+@router.post("/mpesa/transactions")
+async def create_mpesa_transaction(
+    payload: MpesaTransactionRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     try:
-        payload = await request.json()
-        phone_number = payload.get("phone_number")
-        message = payload.get("message")
-        user_id = payload.get("user_id")  # optional if you include it from the app
+        # 🔒 Idempotency (HARD GUARANTEE)
+        existing = db.query(Transaction).filter(
+            Transaction.user_id == current_user.id,
+            Transaction.reference == payload.tx_code
+        ).first()
 
-        if not message:
-            raise HTTPException(status_code=400, detail="Missing SMS message body")
-
-        parsed = parse_mpesa_message(message)
-        if not parsed:
-            raise HTTPException(status_code=422, detail="Could not parse M-Pesa message")
-
-        # Check for duplicates
-        existing = db.query(Transaction).filter_by(mpesa_receipt=parsed["mpesa_receipt"]).first()
         if existing:
-            return {"status": "duplicate", "receipt": parsed["mpesa_receipt"]}
+            logger.info(f"⏭️ Duplicate ignored: {payload.tx_code}")
+            raise HTTPException(status_code=409, detail="Transaction already exists")
 
         txn = Transaction(
-            name=parsed["counterparty"],
-            amount=parsed["amount"],
-            date=parsed["date"],
-            category=parsed["category"],
-            description=parsed["description"],
-            transaction_type=parsed["type"],
-            type=parsed["type"],
-            phone_number=phone_number,
-            mpesa_receipt=parsed["mpesa_receipt"],
-            user_id=user_id,  # link automatically if provided
-            source="mpesa",
+            user_id=current_user.id,
+            name=payload.counterparty or "M-Pesa",
+            amount=payload.amount,
+            date=payload.occurred_at,
+            category="M-Pesa",
+            reference=payload.tx_code,
+            type=payload.type,
+            source="sms",
+            description=f"M-Pesa {payload.type}",
+            raw_content=payload.raw_text
         )
 
         db.add(txn)
         db.commit()
+        db.refresh(txn)
 
-        return {"status": "success", "parsed": parsed}
+        logger.info(f"✅ M-Pesa transaction saved: {payload.tx_code}")
 
-    except Exception as e:
-        print(f"🔥 Error syncing M-Pesa SMS: {e}")
-        raise HTTPException(status_code=500, detail="Failed to sync M-Pesa SMS")
-
-@router.post("/transactions/sync")
-async def sync_transaction_sms(data: dict, db: Session = Depends(get_db)):
-    """
-    Receives M-Pesa SMS, parses it, and stores a clean transaction.
-    """
-    try:
-        user_id = data.get("user_id")
-        sms = data.get("sms", "").strip()
-
-        if not sms or not user_id:
-            raise HTTPException(status_code=400, detail="Missing SMS text or user_id")
-
-        parsed = parse_mpesa_message(sms)
-        if not parsed["amount"]:
-            raise HTTPException(status_code=422, detail="Could not parse amount")
-
-        transaction = Transaction(
-            user_id=user_id,
-            amount=parsed["amount"],
-            type=parsed["type"],
-            description=f"M-Pesa transaction with {parsed['merchant']}",
-            reference=parsed["reference"],
-            balance=parsed["balance"],
-            date=parsed["timestamp"],
-            name=parsed["merchant"],
-            transaction_type=parsed["type"],
-            source="sms"
-        )
-
-        db.add(transaction)
-        db.commit()
-
-        return {
-            "status": "success",
-            "message": "M-Pesa SMS parsed successfully",
-            "data": parsed
-        }
+        return {"status": "success", "id": txn.id}
 
     except HTTPException:
         raise
     except Exception as e:
-        print("🔥 Error parsing SMS:", e)
-        raise HTTPException(status_code=500, detail="Internal server error while parsing M-Pesa SMS")
+        db.rollback()
+        logger.error(f"❌ Transaction Save Error: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
-# --- 🔄 NEW ENDPOINT: Sync and auto-link M-Pesa transactions to users ---
-# @router.post("/mpesa/sync")
-# async def sync_mpesa_transactions(data: list[dict], db: Session = Depends(get_db)):
-#     """
-#     Sync M-Pesa transactions:
-#     - Adds new ones
-#     - Updates changed ones
-#     - Skips exact duplicates
-#     - Auto-detects income vs expense
-#     - Returns full updated transaction list for the user
-#     """
-#     try:
-#         synced_count = 0
-#         updated_count = 0
-#         skipped = 0
-#         affected_user_id = None
 
-#         for tx in data:
-#             phone = tx.get("phone_number") or tx.get("mpesa_phone")
-#             user_id = None
-
-#             # 🔹 Normalize phone and find linked user
-#             if phone:
-#                 normalized_phone = (
-#                     phone.replace(" ", "")
-#                     .replace("-", "")
-#                     .replace("+254", "0")
-#                     .strip()
-#                 )
-#                 user = (
-#                     db.query(User)
-#                     .filter((User.phone == phone) | (User.phone == normalized_phone))
-#                     .first()
-#                 )
-#                 if user:
-#                     user_id = user.id
-#                     affected_user_id = user_id
-
-#             # 🔹 Infer transaction type intelligently
-#             description = (tx.get("description") or "").lower()
-#             raw_type = tx.get("transaction_type") or tx.get("type") or ""
-#             if not raw_type:
-#                 if any(word in description for word in ["received", "deposit", "credited", "from", "reversal"]):
-#                     tx_type = "income"
-#                 else:
-#                     tx_type = "expense"
-#             else:
-#                 tx_type = raw_type.lower()
-
-#             # 🔹 Prepare fields
-#             amount = float(tx.get("amount", 0))
-#             category = tx.get("category", "M-Pesa")
-#             date = tx.get("date") or datetime.utcnow()
-#             mpesa_receipt = tx.get("mpesa_receipt")
-#             source = "mpesa"
-
-#             # 🔹 Look for existing transaction
-#             existing_tx = (
-#                 db.query(Transaction)
-#                 .filter(
-#                     (Transaction.mpesa_receipt == mpesa_receipt)
-#                     | (
-#                         (Transaction.amount == amount)
-#                         & (Transaction.date == date)
-#                         & (Transaction.description == tx.get("description"))
-#                     )
-#                 )
-#                 .first()
-#             )
-
-#             if existing_tx:
-#                 # Check if data changed
-#                 has_changes = False
-#                 if (
-#                     existing_tx.amount != amount
-#                     or existing_tx.type != tx_type
-#                     or existing_tx.category != category
-#                     or existing_tx.description != tx.get("description", "")
-#                 ):
-#                     existing_tx.amount = amount
-#                     existing_tx.type = tx_type
-#                     existing_tx.category = category
-#                     existing_tx.description = tx.get("description", "")
-#                     existing_tx.date = date
-#                     has_changes = True
-
-#                 if has_changes:
-#                     updated_count += 1
-#                 else:
-#                     skipped += 1
-#                 continue
-
-#             # 🔹 Otherwise add new transaction
-#             new_tx = Transaction(
-#                 user_id=user_id,
-#                 amount=amount,
-#                 type=tx_type,
-#                 category=category,
-#                 description=tx.get("description", ""),
-#                 date=date,
-#                 mpesa_receipt=mpesa_receipt,
-#                 source=source,
-#                 phone=phone,
-#             )
-#             db.add(new_tx)
-#             synced_count += 1
-
-#         db.commit()
-
-#         # 🔹 Fetch updated transactions list (if a user was found)
-#         updated_transactions = []
-#         if affected_user_id:
-#             updated_transactions = (
-#                 db.query(Transaction)
-#                 .filter(Transaction.user_id == affected_user_id)
-#                 .order_by(Transaction.date.desc())
-#                 .all()
-#             )
-
-#         return {
-#             "message": (
-#                 f"✅ {synced_count} added, 🔄 {updated_count} updated, ⏩ {skipped} unchanged."
-#             ),
-#             "added": synced_count,
-#             "updated": updated_count,
-#             "skipped": skipped,
-#             "transactions": [
-#                 {
-#                     "id": t.id,
-#                     "amount": t.amount,
-#                     "type": t.type,
-#                     "category": t.category,
-#                     "description": t.description,
-#                     "date": t.date,
-#                     "source": t.source,
-#                     "phone": t.phone,
-#                 }
-#                 for t in updated_transactions
-#             ],
-#         }
-
-#     except Exception as e:
-#         logger.error("🔥 M-Pesa sync error: %s", str(e))
-#         raise HTTPException(status_code=500, detail=f"Error syncing M-Pesa transactions: {e}")
 
 @router.post("/auth/sync_from_supabase")
 async def sync_from_supabase(
@@ -451,172 +387,102 @@ async def link_phone(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    """
-    Link a phone number to the user's account, update Supabase metadata,
-    and automatically sync M-Pesa transactions.
-    """
     phone = data.get("phone")
     if not phone:
         raise HTTPException(status_code=400, detail="Phone number required")
     
-    # ✅ Ensure phone number is unique
+    # 1. Ensure phone number is unique to prevent account hijacking
     existing = db.query(User).filter(User.phone == phone).first()
     if existing and existing.id != current_user.id:
         raise HTTPException(status_code=400, detail="Phone number already linked to another account")
     
-    # ✅ Update local user record
+    # 2. Update local user record
     current_user.phone = phone
-    db.commit()
-    db.refresh(current_user)
+    db.add(current_user)
     
-    # ✅ Update Supabase metadata using ADMIN client
+    # 3. Update Supabase metadata (Optional but recommended for Auth consistency)
     try:
         supabase_admin = get_supabase_admin()
-        
-        # Update user metadata in Supabase
-        response = supabase_admin.auth.admin.update_user_by_id(
+        supabase_admin.auth.admin.update_user_by_id(
             current_user.id,
             {"user_metadata": {"phone_number": phone}}
         )
-        
-        logger.info(f"📱 Supabase metadata updated for user {current_user.id} (email: {current_user.email})")
-        
     except Exception as e:
-        logger.warning(f"⚠️ Could not update Supabase metadata: {str(e)}")
-        # Don't fail the entire request if Supabase update fails
-        # The phone is still linked in your local database
+        logger.warning(f"⚠️ Supabase sync failed: {str(e)}")
+
+    # 4. INTERNAL SYNC: Reassign all orphaned transactions
+    # This combines your previous steps 2 and 3 into one efficient update
+    updated_count = db.query(Transaction).filter(
+        Transaction.account_id == phone,
+        Transaction.user_id.is_(None)
+    ).update({"user_id": current_user.id}, synchronize_session=False)
     
-    # ✅ Reassign transactions linked only by phone
-    updated = db.query(Transaction).filter(
-        Transaction.user_id.is_(None),
-        Transaction.account_id == phone
-    ).update({"user_id": current_user.id})
-    db.commit()
-    
-    # ✅ Sync any unassigned M-Pesa transactions from API
-    added_count = 0
     try:
-        logger.info(f"🔄 Syncing M-Pesa transactions for {phone}...")
-        async with httpx.AsyncClient() as client:
-            response = await client.get(f"{settings.API_BASE_URL}/api/mpesa/transactions")
-            
-            if response.status_code == 200:
-                mpesa_txns = response.json()
-                
-                for txn in mpesa_txns:
-                    if txn.get("account_id") == phone:
-                        # Check if transaction already exists
-                        exists = db.query(Transaction).filter(
-                            Transaction.amount == txn["amount"],
-                            Transaction.date == txn["date"],
-                            Transaction.account_id == phone
-                        ).first()
-                        
-                        if not exists:
-                            new_txn = Transaction(
-                                name=txn.get("name", "M-Pesa User"),
-                                amount=txn["amount"],
-                                date=datetime.strptime(txn["date"], "%Y-%m-%d").date(),
-                                category=txn.get("category", "M-Pesa"),
-                                account_id=phone,
-                                transaction_type=txn.get("transaction_type", "Pay Bill"),
-                                type=txn.get("type", "income"),
-                                source="mpesa",
-                                description=txn.get("description", ""),
-                                user_id=current_user.id
-                            )
-                            db.add(new_txn)
-                            added_count += 1
-                
-                db.commit()
-                logger.info(f"✅ Synced {added_count} new M-Pesa transactions for {phone}")
-            else:
-                logger.warning(f"⚠️ M-Pesa sync failed: {response.status_code} - {response.text}")
-                
+        db.commit()
     except Exception as e:
-        logger.error(f"❌ Error syncing M-Pesa transactions: {str(e)}")
-        # Don't fail the entire request if M-Pesa sync fails
-    
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Database update failed")
+
     return {
-        "message": f"Phone linked successfully. {updated} existing transactions linked and {added_count} new transactions synced.",
+        "status": "success",
+        "message": "Phone linked successfully",
         "phone": phone,
-        "user_id": current_user.id
+        "linked_transactions_count": updated_count
     }
 
 
-@router.post("/auth/sync_on_login")
-async def sync_on_login(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
+# Add this temporary endpoint to fix your existing data
+@router.post("/fix-transaction-classification")
+async def fix_all_transactions(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
 ):
     """
-    Called after Supabase login.
-    Auto-syncs user's phone number from Supabase metadata
-    and links any existing M-Pesa transactions.
+    One-time fix for misclassified transactions.
     """
     try:
-        phone = current_user.phone
-        if not phone:
-            logger.warning("⚠️ No phone number found for user %s", current_user.email)
-            return {"message": "No phone number in Supabase metadata. Skipping sync."}
-
-        logger.info("🔄 Syncing M-Pesa transactions for user %s (%s)", current_user.email, phone)
-
-        # Reassign any M-Pesa transactions linked only by phone
-        updated = db.query(Transaction).filter(
-            Transaction.user_id.is_(None),
-            Transaction.account_id == phone
-        ).update({Transaction.user_id: current_user.id})
-
-        db.commit()
-
-        # Optionally, pull any remote M-Pesa transactions and add if missing
-        async with httpx.AsyncClient() as client:
-            response = await client.get("http://localhost:8000/api/mpesa/transactions")
-
-            if response.status_code == 200:
-                mpesa_txns = response.json()
-                added_count = 0
-                for txn in mpesa_txns:
-                    if txn.get("account_id") == phone:
-                        exists = db.query(Transaction).filter(
-                            Transaction.amount == txn["amount"],
-                            Transaction.date == txn["date"],
-                            Transaction.account_id == phone
-                        ).first()
-                        if not exists:
-                            new_txn = Transaction(
-                                name=txn.get("name", "M-Pesa User"),
-                                amount=txn["amount"],
-                                date=datetime.strptime(txn["date"], "%Y-%m-%d").date(),
-                                category=txn.get("category", "M-Pesa"),
-                                account_id=phone,
-                                transaction_type=txn.get("transaction_type", "Pay Bill"),
-                                type=txn.get("type", "income"),
-                                source="mpesa",
-                                description=txn.get("description", "")
-                            )
-                            new_txn.user_id = current_user.id
-                            db.add(new_txn)
-                            added_count += 1
-
-                db.commit()
-                logger.info("✅ Added %d new M-Pesa transactions for %s", added_count, phone)
+        transactions = db.query(Transaction).filter(
+            Transaction.user_id == current_user.id
+        ).all()
+        
+        fixed = []
+        for txn in transactions:
+            original_type = txn.type
+            
+            # Classify based on category
+            category = (txn.category or '').lower()
+            if 'shopping' in category:
+                correct_type = 'expense'
+            elif any(word in category for word in ['food', 'transport', 'bills', 'rent']):
+                correct_type = 'expense'
+            elif any(word in category for word in ['salary', 'payment', 'business']):
+                correct_type = 'income'
             else:
-                logger.warning("⚠️ Failed to fetch remote M-Pesa transactions: %s", response.text)
-
+                # Keep original if we can't determine
+                continue
+            
+            if original_type != correct_type:
+                txn.type = correct_type
+                fixed.append({
+                    'id': txn.id,
+                    'category': txn.category,
+                    'original': original_type,
+                    'corrected': correct_type
+                })
+        
+        if fixed:
+            db.commit()
+            logger.info(f"Fixed {len(fixed)} transactions")
+        
         return {
-            "message": f"✅ Sync complete: {updated} local transactions linked.",
-            "phone": phone,
-            "user_id": current_user.id
+            'fixed_count': len(fixed),
+            'fixed_transactions': fixed,
+            'message': f'Fixed {len(fixed)} transaction classifications'
         }
-
+        
     except Exception as e:
-        logger.error("❌ Error in /auth/sync_on_login: %s", str(e))
+        logger.error(f"Error fixing transactions: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
-
-
 
 
 

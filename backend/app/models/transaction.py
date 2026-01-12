@@ -52,9 +52,11 @@ class Transaction(Base):
     source = Column(String, nullable=True, default="manual")
     type = Column(String, nullable=False, default="expense")
     currency = Column(String, default="KES")
+    raw_content = Column(Text, nullable=True)
 
     user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
     user = relationship("User", back_populates="transactions")
+
 
 
 class Alert(Base):
@@ -79,6 +81,7 @@ class AICache(Base):
     alert_hash = Column(String(128), index=True)
     alert_title = Column(String(255))
     alert_message = Column(Text)
+    applied = Column(Boolean, default=False)
     transaction_summary = Column(JSONB)
     ai_response = Column(Text, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

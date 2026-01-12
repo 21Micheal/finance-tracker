@@ -1,96 +1,112 @@
-from fastapi import APIRouter, Depends, HTTPException, Header
+# # app/api/auth.py - NEW FILE
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.models.transaction import User
-from app.models.transaction import Transaction
+from app.api.deps import get_current_user
+from app.models.transaction import User, Transaction
+from app.api.routes.user_routes import normalize_phone
+from datetime import datetime
+import httpx
 from app.config import settings
-import requests
 import logging
 
-router = APIRouter(prefix="/auth", tags=["Auth"])
+router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 logger = logging.getLogger(__name__)
 
-SUPABASE_URL = settings.SUPABASE_URL
-SUPABASE_SERVICE_ROLE_KEY = settings.SUPABASE_SERVICE_KEY
-
-
 @router.get("/me")
-async def get_current_user(
-    authorization: str = Header(None),
+async def get_current_user_info(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """Get current user info with M-Pesa transaction linking"""
+    # Auto-link phone number if found in M-Pesa transactions
+    if current_user.phone:
+        # Reassign orphaned M-Pesa transactions to this user
+        updated = db.query(Transaction).filter(
+            Transaction.user_id.is_(None),
+            Transaction.account_id == current_user.phone
+        ).update({Transaction.user_id: current_user.id})
+        
+        if updated > 0:
+            db.commit()
+            logger.info(f"Linked {updated} orphaned transactions for user {current_user.id}")
+    
+    return {
+        "id": current_user.id,
+        "email": current_user.email,
+        "phone": current_user.phone,
+        "linked_mpesa": bool(current_user.phone),
+        "created_at": current_user.created_at
+    }
+
+@router.post("/sync_on_login")
+async def sync_on_login(
+    data: dict = None,  # Make optional
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
-    Verify Supabase token, return backend user record,
-    and auto-link any matching M-Pesa data by phone number.
+    Sync user data on login - primarily links orphaned transactions.
     """
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing or invalid token")
-
-    token = authorization.split(" ")[1]
-
     try:
-        # 1️⃣ Verify token with Supabase
-        res = requests.get(
-            f"{SUPABASE_URL}/auth/v1/user",
-            headers={"Authorization": f"Bearer {token}"}
-        )
-
-        if res.status_code != 200:
-            logger.warning("❌ Invalid Supabase token: %s", res.text)
-            raise HTTPException(status_code=401, detail="Invalid token")
-
-        supabase_user = res.json()
-        email = supabase_user.get("email")
-        sub = supabase_user.get("id")
-        metadata = supabase_user.get("user_metadata", {})
-        phone = metadata.get("phone_number") or metadata.get("phone")
-
-        if not email:
-            raise HTTPException(status_code=400, detail="Invalid Supabase user payload")
-
-        # 2️⃣ Find or create backend user
-        user = db.query(User).filter(User.supabase_id == sub).first()
-
-        if not user:
-            user = User(email=email, supabase_id=sub)
-            db.add(user)
+        # 1. Normalize user's phone for accurate matching
+        phone = current_user.phone
+        if phone:
+            phone = normalize_phone(phone)
+            current_user.phone = phone
             db.commit()
-            db.refresh(user)
-            logger.info("🆕 Created new backend user: %s", email)
 
-        # 3️⃣ Auto-link phone number if found in M-Pesa transactions
-        if not user.phone and phone:
-            logger.info("🔗 Checking for M-Pesa transactions linked to %s", phone)
+        # 2. CLAIM ORPHANED TRANSACTIONS
+        linked_count = 0
+        if phone:
+            linked_count = db.query(Transaction).filter(
+                Transaction.user_id.is_(None),
+                (Transaction.phone_number == phone) | (Transaction.account_id == phone)
+            ).update(
+                {Transaction.user_id: current_user.id}, 
+                synchronize_session=False
+            )
+            db.commit()
+        
+        # 3. Optional: Process incoming transactions from frontend
+        incoming_txns = data.get("transactions", []) if data else []
+        synced_count = 0
+        
+        if incoming_txns:
+            valid_columns = Transaction.__table__.columns.keys()
+            for tx_data in incoming_txns:
+                tx_id = tx_data.get("id")
+                existing = db.query(Transaction).filter(Transaction.id == tx_id).first()
 
-            # Check if another user already has this phone
-            existing = db.query(User).filter(User.phone == phone).first()
-            if existing and existing.id != user.id:
-                logger.warning("⚠️ Phone %s already linked to another user", phone)
-            else:
-                # Assign phone to current user
-                user.phone = phone
-                db.commit()
-                db.refresh(user)
+                cleaned_tx_data = {
+                    k: v for k, v in tx_data.items() 
+                    if k in valid_columns
+                }
 
-                # Reassign orphaned M-Pesa transactions to this user
-                updated = db.query(Transaction).filter(
-                    Transaction.user_id.is_(None),
-                    Transaction.account_id == phone
-                ).update({Transaction.user_id: user.id})
-                db.commit()
+                if existing:
+                    if existing.user_id is None:
+                        existing.user_id = current_user.id
+                        synced_count += 1
+                else:
+                    new_txn = Transaction(**cleaned_tx_data)
+                    new_txn.user_id = current_user.id
+                    db.add(new_txn)
+                    synced_count += 1
+            
+            db.commit()
+        
+        logger.info(f"🔄 Sync complete for {current_user.email}: {linked_count} claimed, {synced_count} synced.")
 
-                logger.info("✅ Linked phone %s and reassigned %d transactions", phone, updated)
-
-        # 4️⃣ Return enriched user info
         return {
-            "id": user.id,
-            "email": user.email,
-            "phone": user.phone,
-            "name": user.name,
-            "created_at": user.created_at,
-            "linked_mpesa": bool(user.phone),
+            "status": "success",
+            "message": f"Sync complete: {linked_count} orphaned transactions claimed.",
+            "user_id": str(current_user.id),
+            "phone": phone,
+            "linked_count": linked_count,
+            "synced_count": synced_count
         }
-
+        
     except Exception as e:
-        logger.error("🔥 Error verifying Supabase token: %s", str(e))
-        raise HTTPException(status_code=500, detail="Error verifying user")
+        db.rollback()
+        logger.error(f"❌ Error in sync_on_login: {e}")
+        raise HTTPException(status_code=500, detail=str(e))

@@ -9,6 +9,9 @@ from app.api.routes import goals
 from app.api.routes import ai_routes
 from app.api.routes import alerts
 from app.api.routes import insights
+from app.api.routes import user_routes
+from app.api.routes import auth_routes
+from app.api.routes import advisor
 from app.config import settings
 import uvicorn
 import logging
@@ -126,6 +129,9 @@ app.include_router(ai_routes.router)
 app.include_router(alerts.router)
 app.include_router(insights.router)
 app.include_router(goals.router)
+app.include_router(auth_routes.router)
+app.include_router(user_routes.router)
+app.include_router(advisor.router)
 
 # Conditionally include M-Pesa routes if configured
 # if getattr(settings, 'MPESA_ENABLED', False):

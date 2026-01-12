@@ -9,9 +9,15 @@ from app.core.advisor_context_manager import update_advisor_context
 from typing import List, Dict
 import logging
 from datetime import datetime
+from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api", tags=["AI Insights"])
+
+
+# Schema for the mark-applied request
+class MarkAppliedRequest(BaseModel):
+    applied: bool = True
 
 @router.get("/history/{user_id}")
 async def get_ai_insight_history(user_id: str, db: Session = Depends(get_db)):
@@ -29,11 +35,12 @@ async def get_ai_insight_history(user_id: str, db: Session = Depends(get_db)):
 
         return [
             {
-                "id": r.id,
+                "id": str(r.id),
                 "alert_title": r.alert_title,
                 "alert_message": r.alert_message,
-                "transactions": r.transaction_summary,
+                "transactions": r.transaction_summary if isinstance(r.transaction_summary, (list, dict)) else [],
                 "ai_response": r.ai_response,
+                "applied": getattr(r, 'applied', False), # Safe access
                 "created_at": r.created_at.isoformat() if r.created_at else None,
             }
             for r in results
@@ -41,6 +48,43 @@ async def get_ai_insight_history(user_id: str, db: Session = Depends(get_db)):
     except Exception as e:
         logger.error(f"Error fetching AI insight history: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to fetch insight history")
+    
+  
+
+@router.post("/insights/{insight_id}/mark-applied")
+async def mark_insight_applied(
+    insight_id: str, 
+    request: MarkAppliedRequest,
+    db: Session = Depends(get_db)
+):
+    """
+    Mark a specific AI insight as 'applied' or 'acknowledged' by the user.
+    """
+    try:
+        # Find the record in the AICache table
+        insight = db.query(AICache).filter(AICache.id == insight_id).first()
+
+        if not insight:
+            raise HTTPException(status_code=404, detail="Insight not found")
+
+        # Update the status
+        # Note: Ensure your AICache model has an 'applied' boolean column
+        insight.applied = request.applied
+        insight.updated_at = datetime.utcnow()
+        
+        db.commit()
+        
+        return {
+            "success": True, 
+            "id": insight_id, 
+            "applied": insight.applied
+        }
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error marking insight applied: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 @router.get("/advisor/{user_id}")
 async def contextual_advice(user_id: str, db: Session = Depends(get_db)):

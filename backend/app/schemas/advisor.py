@@ -14,3 +14,6 @@ class FinancialTrendItem(BaseModel):
 class FinancialTrendsResponse(BaseModel):
     user_id: str
     trends: List[FinancialTrendItem]
+
+class GoalsPayload(BaseModel):
+    goals: dict

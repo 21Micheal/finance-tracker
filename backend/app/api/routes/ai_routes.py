@@ -1,5 +1,5 @@
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends, Query
+from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime
 from collections import defaultdict
@@ -10,7 +10,9 @@ from typing import Union
 # Removed sklearn dependency and use numpy.polyfit for simple linear regression fallback
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.models.transaction import Transaction
+from app.models.transaction import Transaction, User
+# Import current user dependency and User model for authentication
+from app.api.deps import get_current_user
 from prophet import Prophet
 import logging
 
@@ -22,8 +24,12 @@ class Transaction(BaseModel):
     id: Union[int, str, UUID]
     date: str
     amount: float
-    type: str
-    category: Optional[str] = "Other"
+    type: str = Field(default="expense")  # Add default
+    category: str = Field(default="Other")  # Add default
+    
+    class Config:
+        # Allow extra fields from your database
+        extra = "ignore"
 
 class AIRequest(BaseModel):
     transactions: List[Transaction]
@@ -153,16 +159,65 @@ async def ai_insights(request: AIRequest):
         raise HTTPException(status_code=500, detail=f"Failed to process insights: {e}")
 
 
+@router.post("/ai_spending_trends_debug")
+async def ai_spending_trends_debug(request: dict):
+    """Debug endpoint to see raw request data"""
+    logger.info(f"📥 RAW REQUEST DATA: {request}")
+    
+    # Check transaction structure
+    if "transactions" in request:
+        transactions = request["transactions"]
+        logger.info(f"📊 Transactions count: {len(transactions)}")
+        
+        if transactions and len(transactions) > 0:
+            sample = transactions[0]
+            logger.info(f"📋 Sample transaction structure:")
+            logger.info(f"  Keys: {list(sample.keys())}")
+            logger.info(f"  Types: {{key: type(value) for key, value in sample.items()}}")
+            
+            # Check for required fields
+            required = ["id", "date", "amount", "type", "category"]
+            missing = [field for field in required if field not in sample]
+            if missing:
+                logger.error(f"❌ Missing fields: {missing}")
+    
+    return {"received": True, "data": request}
+
 # ---------- /api/ai_spending_trends ----------
 @router.post("/ai_spending_trends")
 async def ai_spending_trends(request: AIRequest):
     try:
+                # DEBUG: Log the incoming request
+        logger.info(f"📥 Received AI spending trends request:")
+        logger.info(f"  Transaction count: {len(request.transactions) if request.transactions else 0}")
+        logger.info(f"  Currency: {request.currency}")
+        
+        if request.transactions and len(request.transactions) > 0:
+            sample_txn = request.transactions[0]
+            logger.info(f"  Sample transaction: {sample_txn}")
+            logger.info(f"  Sample transaction type: {type(sample_txn)}")
         transactions = request.transactions
         if not transactions:
-            raise HTTPException(status_code=400, detail="No transactions provided")
+            return {"trends": [], "message": "No transactions to analyze"}
 
-        df = pd.DataFrame([t.dict() for t in transactions])
+        # Convert Pydantic objects to simple dictionaries safely
+        # model_dump is the Pydantic v2 way; use .dict() if on v1
+        data = []
+        for t in transactions:
+            d = t.model_dump() if hasattr(t, 'model_dump') else t.dict()
+            # Ensure the UUID/Int ID is a string so Pandas doesn't choke
+            d['id'] = str(d['id']) 
+            data.append(d)
+
+        df = pd.DataFrame(data)
+        
+        # Ensure date is parsed correctly
         df["date"] = pd.to_datetime(df["date"])
+        
+        # ⚠️ CRITICAL FIX: The logic crashes if there is only 1 month of data
+        # because current_month = group.iloc[-1] and last_month = group.iloc[-2]
+        # will throw an IndexError if len(group) < 2.
+        
         df["month"] = df["date"].dt.to_period("M")
 
         monthly = (
@@ -175,12 +230,18 @@ async def ai_spending_trends(request: AIRequest):
         trends = []
         for category, group in monthly.groupby("category"):
             group = group.sort_values("month")
+            
+            # Skip if we don't have enough months to compare
             if len(group) < 2:
+                trends.append(f"⚖️ Spending in {category} is being tracked for the first time.")
                 continue
 
             last_month = group.iloc[-2]
             current_month = group.iloc[-1]
-            change = ((current_month["amount"] - last_month["amount"]) / last_month["amount"]) * 100
+            
+            # Avoid division by zero
+            denom = last_month["amount"] if last_month["amount"] != 0 else 1
+            change = ((current_month["amount"] - denom) / denom) * 100
 
             if change > 10:
                 message = f"📈 Your spending in {category} increased by {change:.1f}% this month."
@@ -188,136 +249,96 @@ async def ai_spending_trends(request: AIRequest):
                 message = f"📉 You reduced spending in {category} by {abs(change):.1f}% — great job!"
             else:
                 message = f"⚖️ Your spending in {category} is stable."
-
             trends.append(message)
 
         return {"trends": trends}
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Trend Analysis Error: {e}")
-
-
-@router.get("/predict-insights")
-def predict_insights(user_id: str, db: Session = Depends(get_db)):
-    transactions = db.query(Transaction).filter(Transaction.user_id == user_id).all()
-    if not transactions:
-        raise HTTPException(status_code=404, detail="No transactions found")
-
-    # Convert to DataFrame
-    df = pd.DataFrame([{
-        "amount": t.amount,
-        "type": t.type,
-        "date": t.date
-    } for t in transactions])
-
-    df["month"] = df["date"].dt.to_period("M").astype(str)
-
-    monthly_summary = (
-        df.groupby(["month", "type"])["amount"].sum().unstack(fill_value=0)
-    ).reset_index()
-
-    monthly_summary["savings"] = monthly_summary.get("income", 0) - monthly_summary.get("expense", 0)
-
-    # Prepare regression model using numpy.polyfit as a lightweight fallback to sklearn
-    months_numeric = np.arange(len(monthly_summary))
-
-    def forecast(column):
-        # safe extraction and dtype cast
-        y = monthly_summary[column].values.astype(float)
-        if len(y) == 0:
-            return [0.0, 0.0, 0.0]
-        if len(y) == 1:
-            # not enough points to fit a line; repeat the known value
-            return [float(y[0]), float(y[0]), float(y[0])]
-
-        # Fit a simple linear model (degree 1) and predict next 3 periods
-        try:
-            slope, intercept = np.polyfit(months_numeric, y, 1)
-        except Exception:
-            # fallback to constant prediction on failure
-            return [float(y[-1]), float(y[-1]), float(y[-1])]
-
-        future_x = months_numeric[-1] + np.arange(1, 4)
-        future_y = intercept + slope * future_x
-        return [float(v) for v in future_y]
-
-    future_income = forecast("income") if "income" in monthly_summary.columns else [0.0, 0.0, 0.0]
-    future_expense = forecast("expense") if "expense" in monthly_summary.columns else [0.0, 0.0, 0.0]
-    future_savings = [i - e for i, e in zip(future_income, future_expense)]
-
-    return {
-        "history": monthly_summary.to_dict(orient="records"),
-        "forecast": {
-            "months_ahead": ["Next 1 Month", "Next 2 Months", "Next 3 Months"],
-            "income": future_income,
-            "expense": future_expense,
-            "savings": future_savings
-        }
-    }
+        logger.error(f"Trend Analysis Error: {str(e)}")
+        # Provide the actual error in the response for easier debugging
+        raise HTTPException(status_code=500, detail=f"Internal Server Error: {str(e)}")
 
 @router.get("/predict")
-async def predict_financial_trends(user_id: int, db: Session = Depends(get_db)):
-    """
-    Predicts next 3 months of income, expenses, and savings using Prophet model.
-    Handles seasonality, trends, and anomalies.
-    """
+async def predict_financial_trends(
+    granularity: str = Query("monthly", enum=["weekly", "monthly"]),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
     try:
-        transactions = db.query(Transaction).filter(Transaction.user_id == user_id).all()
-        if not transactions:
-            raise HTTPException(status_code=404, detail="No transactions found for prediction")
+        # 1. Fetch data
+        transactions = db.query(Transaction).filter(Transaction.user_id == current_user.id).all()
 
-        df = pd.DataFrame([{
-            "date": t.date,
-            "amount": t.amount,
-            "type": t.type
-        } for t in transactions])
+        if len(transactions) < 3:
+            return {"forecast": [], "message": "Need at least 3 transactions to generate a forecast."}
 
+        # 2. Preparation
+        df = pd.DataFrame([{"date": t.date, "amount": t.amount, "type": t.type} for t in transactions])
         df["date"] = pd.to_datetime(df["date"])
-        df["month"] = df["date"].dt.to_period("M").dt.to_timestamp()
 
-        # Aggregate income, expense, and savings by month
-        monthly = (
-            df.groupby(["month", "type"])["amount"]
-            .sum()
-            .unstack(fill_value=0)
-            .reset_index()
-        )
-        monthly["income"] = monthly.get("income", 0)
-        monthly["expense"] = monthly.get("expense", 0)
-        monthly["savings"] = monthly["income"] - monthly["expense"]
+        # Calculate Historical Baseline (The "Dynamic Budget")
+        # We take the average of historical monthly expenses to act as a benchmark
+        hist_monthly = df[df["type"] == "expense"].set_index("date").resample("ME")["amount"].sum()
+        avg_monthly_spend = float(hist_monthly.mean()) if not hist_monthly.empty else 0
 
+        if granularity == "weekly":
+            df["period"] = df["date"].dt.to_period("W").dt.to_timestamp()
+            freq_code, periods_to_predict, date_format = "W", 4, "Week %U"
+            benchmark = avg_monthly_spend / 4
+        else:
+            df["period"] = df["date"].dt.to_period("M").dt.to_timestamp()
+            freq_code, periods_to_predict, date_format = "MS", 3, "%B %Y"
+            benchmark = avg_monthly_spend
+
+        # Aggregate metrics for Prophet
+        data_grouped = df.groupby(["period", "type"])["amount"].sum().unstack(fill_value=0).reset_index()
+        for col in ["income", "expense"]:
+            if col not in data_grouped.columns: data_grouped[col] = 0.0
+        
+        if len(data_grouped) < 2:
+            return {"forecast": [], "message": "Insufficient history for this view."}
+
+        # 3. Prediction Logic
         forecasts = {}
-
         def prophet_forecast(series_name):
-            sub_df = pd.DataFrame({
-                "ds": monthly["month"],
-                "y": monthly[series_name]
-            })
-            model = Prophet(seasonality_mode="additive")
+            sub_df = pd.DataFrame({"ds": data_grouped["period"], "y": data_grouped[series_name]})
+            model = Prophet(yearly_seasonality=False, weekly_seasonality=(granularity == "weekly"), daily_seasonality=False)
             model.fit(sub_df)
-            future = model.make_future_dataframe(periods=3, freq="M")
-            forecast = model.predict(future)
-            result = forecast[["ds", "yhat"]].tail(3)
-            return result
+            future = model.make_future_dataframe(periods=periods_to_predict, freq=freq_code)
+            return model.predict(future)[["ds", "yhat"]].tail(periods_to_predict)
 
-        # Forecast each metric
-        for metric in ["income", "expense", "savings"]:
+        for metric in ["income", "expense"]:
             forecasts[metric] = prophet_forecast(metric)
 
-        # Combine results
-        months = forecasts["income"]["ds"].dt.strftime("%Y-%m").tolist()
-        forecast = [
-            {
-                "month": m,
-                "income": float(forecasts["income"].iloc[i]["yhat"]),
-                "expense": float(forecasts["expense"].iloc[i]["yhat"]),
-                "savings": float(forecasts["savings"].iloc[i]["yhat"]),
-            }
-            for i, m in enumerate(months)
-        ]
+        # 4. Format Output with "Smart Baseline" Alerts
+        forecast_result = []
+        for i in range(periods_to_predict):
+            ds = forecasts["income"].iloc[i]["ds"]
+            pred_expense = round(float(forecasts["expense"].iloc[i]["yhat"]), 2)
+            pred_income = round(float(forecasts["income"].iloc[i]["yhat"]), 2)
+            
+            # Alert logic: Is predicted spending > historical average?
+            is_unusual = benchmark > 0 and pred_expense > (benchmark * 1.1) # 10% buffer
+            
+            forecast_result.append({
+                "label": ds.strftime(date_format),
+                "date": ds.strftime("%Y-%m-%d"),
+                "income": pred_income,
+                "expense": pred_expense,
+                "savings": round(pred_income - pred_expense, 2),
+                "insight": {
+                    "baseline_limit": round(benchmark, 2),
+                    "is_above_average": is_unusual,
+                    "difference_from_avg": round(pred_expense - benchmark, 2)
+                }
+            })
 
-        return {"forecast": forecast}
+        return {
+            "granularity": granularity,
+            "historical_avg_spending": round(avg_monthly_spend, 2),
+            "forecast": forecast_result,
+            "alerts": [f"Heads up! Your spending in {f['label']} is predicted to be higher than your usual average." for f in forecast_result if f['insight']['is_above_average']]
+        }
 
     except Exception as e:
-        logger.error(f"Prediction error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Prediction Error: {str(e)}")
+        return {"forecast": [], "error": "Could not generate forecast"}
