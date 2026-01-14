@@ -62,15 +62,20 @@ class Transaction(Base):
 class Alert(Base):
     __tablename__ = "alerts"
 
-    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
-    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"))
-    title = Column(String(255))
-    message = Column(Text)
-    category = Column(String(50))  # "expense", "income", "goal", "system"
-    level = Column(String(50), default="info")  # "info", "warning", "critical"
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
+    title = Column(String(120), nullable=False)
+    message = Column(Text, nullable=False)
+    # Changed from 'level' to 'severity' to match your Schema
+    severity = Column(String(50), default="info")  # "info", "warning", "critical", "goal"
+    category = Column(String(50), nullable=True)   # "spending", "savings", "budget"
     ai_insight = Column(Text, nullable=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
     is_read = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, onupdate=datetime.utcnow)
+
+    def __repr__(self):
+        return f"<Alert(title='{self.title}', severity='{self.severity}')>"
 
 
 class AICache(Base):
